@@ -1,0 +1,14 @@
+import { defineConfig, loadEnv } from 'vite'
+import react from '@vitejs/plugin-react'
+
+export default defineConfig(({ mode }) => {
+  const env = loadEnv(mode, '.', '')
+  return {
+    plugins: [react()],
+    server: {
+      port: 5173,
+      // In development the browser calls /api on the Vite server, which forwards to FastAPI.
+      proxy: { '/api': env.VITE_BACKEND_URL || 'http://127.0.0.1:8000' },
+    },
+  }
+})
