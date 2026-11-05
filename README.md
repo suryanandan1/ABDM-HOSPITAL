@@ -16,6 +16,14 @@ Digital Mission (ABDM) under patient consent, both as a **Health Information Pro
 | HIU | AI-assisted consent requests, artefact validation, asynchronous encrypted retrieval, sealed storage, timeline, lab trends |
 | Assistant | Patient timeline, doctor briefing, summaries and Q&A that cite their source records |
 
+![Dashboard](docs/screenshots/02-dashboard.png)
+
+**Contents**: [Architecture](#architecture) · [Screenshots](#screenshots) · [Flow diagrams](#flow-diagrams) ·
+[Installation](#installation-windows-powershell) · [Running](#running) · [Configuration](#configuration-backendenv) ·
+[Workflows](#workflows) · [Testing](#testing) · [Security review](#security-review-phase-6) ·
+[Database](#database-29-tables) · [Integration status](#integration-status-and-simulated-features) ·
+[Known limitations](#known-limitations)
+
 ## Architecture
 
 ```
@@ -38,6 +46,385 @@ business logic; HIP and HIU share one gateway client, transaction log and encryp
 **Stack**: Python 3.11, FastAPI, Pydantic 2, SQLAlchemy 2, SQLite, PyJWT, cryptography, httpx, Mistral AI SDK,
 pandas/rapidfuzz (LOINC mapper); React 18, TypeScript, Vite 5, Material UI 6, React Router, Axios; HL7 FHIR
 Validator 7.x on a bundled Java 21 runtime.
+
+## Screenshots
+
+Taken from the running app (Microsoft Edge, 1440×900) in **simulation mode with synthetic demo data**
+(`python init_db.py --demo` plus a scripted demo visit). No real patients appear anywhere. Click an image to see it
+full size.
+
+### Sign-in and dashboard
+
+| Sign-in | Dashboard (doctor) |
+|---|---|
+| ![Sign-in page](docs/screenshots/01-login.png) | ![Dashboard with patient, ABHA, staff and lab counters](docs/screenshots/02-dashboard.png) |
+| Username and password; a 6-digit authenticator code is asked next when two-step sign-in is on. After 30 minutes without activity the app returns here with a notice. | Counters for patients, ABHA verification, staff, today's consultations, open lab orders and reports waiting for approval; recent patients. The menu shows only what the signed-in role may use. |
+
+### Patients
+
+| Patient list | Patient registration |
+|---|---|
+| ![Patient list with search and ABHA status](docs/screenshots/03-patients.png) | ![Registration form](docs/screenshots/05-patient-registration.png) |
+| Search by name, patient ID or mobile. ABHA chips show *No ABHA*, *ABHA unverified* or *ABHA verified*. | Demographics, contact and optional ABHA number/address, with a duplicate check before saving. An entered ABHA is never trusted until ABDM verifies it. |
+
+| Patient profile | Medical history |
+|---|---|
+| ![Patient profile](docs/screenshots/04-patient-detail.png) | ![Medical history](docs/screenshots/10-patient-history.png) |
+| Demographics, ABHA number/address with how and when it was verified, and the assistant briefing (no AI): conditions, consultations, prescriptions, recent lab results and external records, each with its source. | Only finalized or approved records: active conditions, consultations, prescriptions and lab reports. |
+
+### Clinical work
+
+| Consultation | Prescription |
+|---|---|
+| ![Finalized consultation with vitals and diagnoses](docs/screenshots/06-consultation.png) | ![Approved prescription](docs/screenshots/07-prescription.png) |
+| Vitals, complaint, history, findings, diagnoses with ICD-10 codes, plan and follow-up. Prescriptions and lab orders for the visit sit on the right. Finalized consultations are locked. | Medicines with dose, route, frequency and duration. Draft → submitted → approved by the prescribing doctor. |
+
+| Lab orders (lab technician) | Lab report |
+|---|---|
+| ![Lab order work list](docs/screenshots/08-lab-orders.png) | ![Approved lab report with flags](docs/screenshots/09-lab-report.png) |
+| Work list by status: ordered, sample collected, in progress, completed. | Results with units, reference ranges and automatic *Low/Normal/High* flags. Approved by a doctor other than the person who entered the results. |
+
+### AI documents and assistant
+
+| Document review | Patient assistant |
+|---|---|
+| ![Document review: original beside extracted fields](docs/screenshots/12b-document-review.png) | ![Assistant with timeline and lab trends](docs/screenshots/11-assistant.png) |
+| The original document beside the fields to fill. Here no AI key is configured, so the page says so and staff enter the data manually; with Mistral configured, each field shows the AI value, its confidence and the quoted evidence. | Timeline of own and external records, lab values over time, questions and an AI summary that must cite its sources. Read-only. |
+
+### FHIR
+
+| FHIR records | FHIR bundle |
+|---|---|
+| ![FHIR record list](docs/screenshots/13-fhir-records.png) | ![Resources of an OPConsultRecord bundle](docs/screenshots/14-fhir-record.png) |
+| One record per approved consultation, prescription, lab report or document, with its version and validation state. | The 18 resources of an OPConsultRecord bundle. *Valid* plus *Eligible for HIP sharing* means the current version passed the HL7 validator. |
+
+### ABDM: sharing our records (HIP) and receiving others' (HIU)
+
+| HIP overview | HIP care contexts |
+|---|---|
+| ![HIP configuration and counters](docs/screenshots/15-abdm-hip.png) | ![Linked care contexts](docs/screenshots/15b-hip-care-contexts.png) |
+| Configuration checks and counters for links, care contexts, consents and transfers. The *SIMULATION* label appears on every simulated item. | Validated records become care contexts linked to the patient's ABHA address. Only these can ever be shared. |
+
+| HIU requests | HIU retrieved records |
+|---|---|
+| ![HIU dashboard and request history](docs/screenshots/16-abdm-hiu.png) | ![Records retrieved from another provider](docs/screenshots/16b-hiu-retrieved-records.png) |
+| Consent requests and their progress in plain language. | Records received under consent: source, category, consent and erase date, plus a timeline and repeated lab tests (HbA1c trend). Visible to doctors and administrators only, and every view is audited. |
+
+### Administration and security
+
+| Staff | Audit log |
+|---|---|
+| ![Staff list](docs/screenshots/17-staff.png) | ![Audit log](docs/screenshots/18-audit-logs.png) |
+| Accounts, roles, active state and a *2-step* chip. Editing a user can reset their password or two-step sign-in. | Who did what and when, without patient details. |
+
+| Two-step sign-in setup |
+|---|
+| ![Two-step sign-in setup dialog](docs/screenshots/19-two-step-setup.png) |
+| Account menu → *Two-step sign-in*: add the key (or open the link) in an authenticator app, then confirm a code. The key shown belongs to a throw-away demo database. |
+
+## Flow diagrams
+
+The diagrams are written in [Mermaid](https://mermaid.js.org/), which GitHub, GitLab and VS Code (with a Mermaid
+extension) draw as pictures.
+
+### 1. System overview
+
+```mermaid
+flowchart TB
+    UI["Browser: React + MUI (frontend/)"]
+    SEC["security.py<br/>session cookie + CSRF · role permissions · hospital scoping"]
+    UI -- "/api" --> SEC
+
+    subgraph Backend["FastAPI backend (backend/app)"]
+        CORE["routers/<br/>hospital · staff · patients<br/>consultations · prescriptions · lab · audit"]
+        SMART["extraction.py · assistant.py · loinc.py<br/>AI + terminology (suggestions only)"]
+        FHIR["fhir_sources.py → fhir.py → fhir_validation.py<br/>FHIR bundles + validation"]
+        ABDMM["hip/ (share) · hiu/ (receive)<br/>gateway client · encryption · sealing"]
+    end
+    SEC --> CORE & SMART & FHIR & ABDMM
+
+    DB[("SQLite / PostgreSQL<br/>29 tables + uploads/")]
+    AI["Mistral AI<br/>(optional)"]
+    MAP["LOINC mapping<br/>project"]
+    VAL["HL7 FHIR Validator<br/>+ terminology server"]
+    GW["ABDM gateway +<br/>consent manager"]
+    OTHER["Other hospitals<br/>(HIP / HIU)"]
+
+    CORE --> DB
+    SMART --> AI
+    SMART --> MAP
+    FHIR --> VAL
+    ABDMM <-- "requests + callbacks /api/v3/..." --> GW
+    ABDMM <-- "encrypted records" --> OTHER
+```
+
+Every backend module reads and writes the same database (only one arrow is drawn to keep the picture readable).
+
+### 2. Roles and what they can do
+
+```mermaid
+flowchart LR
+    ADMIN["Hospital administrator"] --> ALL["Everything, including staff,<br/>hospital profile, HIP configuration"]
+    DOC["Doctor"] --> D1["Consultations, prescriptions,<br/>lab orders, approve lab reports,<br/>approve documents, FHIR,<br/>HIU requests + external records"]
+    REC["Receptionist"] --> R1["Register, search and<br/>update patients"]
+    LAB["Lab technician"] --> L1["Lab catalogue, samples,<br/>results, documents, LOINC"]
+    HIMS["Health information staff"] --> H1["ABHA verification, audit log,<br/>documents, FHIR, HIP linking,<br/>HIU requests (not record content)"]
+```
+
+Permissions live in `backend/app/security.py` (`ROLES`); every endpoint checks one and every lookup is limited to
+the user's hospital. Finalizing or approving clinical records also needs a linked, active doctor profile.
+
+### 3. Sign-in, sessions and two-step sign-in
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as Staff member
+    participant B as Browser (React)
+    participant A as /api/auth
+    participant DB as Database
+
+    U->>B: username + password
+    B->>A: POST /auth/login
+    A->>DB: failures for this username + address in the last 15 min?
+    alt too many (5 per username+address, 20 per address, 50 per username)
+        A-->>B: 429 Try again in 15 minutes
+    else
+        A->>A: verify scrypt hash (same cost for unknown users)
+        alt wrong password
+            A->>DB: record failure + audit auth.login_failed
+            A-->>B: 401 Invalid username or password
+        else two-step sign-in on, no code yet
+            A-->>B: 401 mfa_required
+            U->>B: 6-digit code from authenticator app
+            B->>A: POST /auth/login (with otp)
+            A->>A: TOTP check, code not used before
+        end
+        A->>DB: clear failures, upgrade old hash, create user_sessions row
+        A-->>B: Set-Cookie abdm_session (HttpOnly, Secure, SameSite=Strict)<br/>+ abdm_csrf (readable by the app)
+    end
+    Note over B,A: Every later request sends the cookie. Changes (POST/PUT/PATCH/DELETE)<br/>also send X-CSRF-Token = abdm_csrf, so other sites cannot forge them.
+    B->>A: GET /api/... (cookie)
+    A->>DB: session exists, not revoked, not expired, used in the last 30 min?
+    A-->>B: data, or 401 → back to sign-in
+    Note over B: No mouse/keyboard activity for 30 min in any tab → the app signs out by itself
+    U->>B: Sign out / Sign out everywhere
+    B->>A: POST /auth/logout (this session) or /auth/logout-all (all sessions)
+```
+
+A password change or reset, a role change, deactivation and turning on two-step sign-in all end the user's other
+sessions. Roles listed in `MFA_REQUIRED_ROLES` see only the two-step setup screen until it is done.
+
+### 4. Patient journey (clinical workflow)
+
+```mermaid
+flowchart TD
+    REG["Receptionist registers patient<br/>(duplicate check)"] --> ABHA{"ABHA given?"}
+    ABHA -- yes --> VER["Health information staff verify it<br/>with ABDM (HIP page)"]
+    ABHA -- no --> CON
+    VER --> CON["Doctor starts consultation (draft):<br/>vitals, complaint, findings, diagnoses (ICD-10)"]
+    CON --> RX["Prescription draft → submit"]
+    RX --> RXA["Prescribing doctor approves"]
+    CON --> ORD["Lab orders (routine / urgent)"]
+    ORD --> SMP["Lab technician collects sample<br/>(barcode) or rejects it"]
+    SMP --> RES["Results entered → flags computed<br/>(Low / Normal / High) + conclusion"]
+    RES --> SUB["Report submitted"]
+    SUB --> APR{"Another doctor reviews"}
+    APR -- approve --> DONE["Report approved, order completed"]
+    APR -- reject with reason --> RES
+    CON --> FIN["Doctor finalizes consultation (locked)"]
+    RXA & DONE & FIN --> HIST["Medical history, assistant timeline"]
+    RXA & DONE & FIN --> FHIR["FHIR record can be generated (see 6)"]
+```
+
+### 5. Record lifecycles
+
+```mermaid
+stateDiagram-v2
+    direction LR
+    state "Consultations, prescriptions, lab reports, AI documents (ClinicalRecord)" as CR {
+        [*] --> draft
+        draft --> pending_approval: submit
+        rejected --> pending_approval: fix + resubmit
+        pending_approval --> approved: doctor approves
+        pending_approval --> rejected: doctor rejects (reason)
+        draft --> cancelled
+        pending_approval --> cancelled
+        approved --> [*]
+    }
+```
+
+Consultations skip the approval step: *Finalize* moves them from draft straight to approved, and they are locked.
+Prescriptions are approved by the prescribing doctor; lab reports by a doctor who did not enter the results.
+
+```mermaid
+stateDiagram-v2
+    direction LR
+    state "Lab order" as LO {
+        [*] --> ordered
+        ordered --> sample_collected: sample collected
+        sample_collected --> ordered: sample rejected (recollect)
+        sample_collected --> in_progress: results entered
+        in_progress --> completed: report approved
+        ordered --> cancelled
+        sample_collected --> cancelled
+    }
+```
+
+```mermaid
+stateDiagram-v2
+    direction LR
+    state "HIU consent request" as HR {
+        [*] --> requested
+        requested --> pending_consent: consent manager accepted
+        pending_consent --> granted: patient grants
+        pending_consent --> denied: patient denies
+        granted --> retrieving: health information requested
+        retrieving --> received: data pushed and decrypted
+        retrieving --> failed
+        granted --> revoked: patient revokes (records erased)
+        received --> revoked
+        received --> expired: dataEraseAt reached (records erased)
+    }
+```
+
+### 6. AI document processing and FHIR generation
+
+```mermaid
+flowchart TD
+    UP["Upload PDF / scan / image / DOCX / TXT"] --> CHK["Checks: extension allow-list,<br/>magic bytes, size limit, random file name"]
+    CHK --> KEY{"MISTRAL_API_KEY set?"}
+    KEY -- no --> MAN["Review screen: manual entry"]
+    KEY -- yes --> OCR["Mistral OCR (PDF/images)<br/>or text extraction (DOCX/TXT)"]
+    OCR --> EX["Mistral extraction into the review schema<br/>value + confidence + evidence quote per field"]
+    EX --> REV["Review screen: original beside fields<br/>staff accept / edit / reject every field"]
+    MAN --> REV
+    REV --> LNK["Link patient + responsible doctor,<br/>confirm LOINC suggestions (loinc.py)"]
+    LNK --> SUBM["Submit"] --> DAP{"Doctor approves?"}
+    DAP -- no --> REV
+    DAP -- yes --> GEN
+
+    subgraph FHIRGEN["FHIR (same for consultations, prescriptions, lab reports)"]
+        GEN["fhir_sources.py: approved record → engine input"] --> MAPF["fhir.py: FHIR R4 document Bundle<br/>(OPConsult, Prescription, DiagnosticReport,<br/>DischargeSummary, Immunization, Wellness,<br/>HealthDocument)"]
+        MAPF --> PRE["Local pre-checks"]
+        PRE --> HL7["HL7 validator: FHIR 4.0.1 + ndhm.in 6.5.0<br/>terminology via FHIR_TX_SERVER"]
+        HL7 --> OKV{"0 errors?"}
+        OKV -- yes --> ELIG["Valid → eligible for HIP sharing"]
+        OKV -- no --> FIX["Fix the source record → regenerate (new version)"]
+    end
+```
+
+AI only suggests. People confirm every value, a doctor approves, and only then is a FHIR record made.
+
+### 7. HIP: sharing this hospital's records through ABDM
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor S as Health info staff
+    participant H as This hospital (HIP)
+    participant G as ABDM gateway / consent manager
+    participant P as Patient (ABHA app)
+    participant U as Requesting HIU
+
+    S->>H: verify patient's ABHA address
+    H->>G: link token request
+    G-->>H: callback: link token (ABHA verified)
+    S->>H: link care contexts (validated FHIR records only)
+    H->>G: add care contexts
+    Note over P,G: Or the patient starts it: discovery → exactly one matching patient → OTP → linked
+    P->>G: grant consent to an HIU
+    G->>H: consent notification (HIP checks it covers linked records)
+    U->>G: health-information request (with its public key)
+    G->>H: request: consent id, date range, HIU key, push URL
+    H->>H: consent granted and unexpired? records inside its scope only
+    H->>H: encrypt each bundle: ECDH Curve25519 + HKDF + AES-GCM
+    H->>U: push encrypted data to the HIU's URL
+    H->>G: status notification per care context
+```
+
+Callbacks from the gateway are only accepted with a valid gateway JWT (checked against ABDM's keys) and the
+right `X-HIP-ID`. Discovery answers never contain record content.
+
+### 8. HIU: getting a patient's records from other providers
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor D as Doctor
+    participant H as This hospital (HIU)
+    participant G as ABDM gateway / consent manager
+    participant P as Patient (ABHA app)
+    participant X as Other hospital (HIP)
+
+    D->>H: patient with verified ABHA + reason
+    opt Suggest with AI
+        H-->>D: proposed purpose, record types, dates (age/gender only sent to AI)
+    end
+    D->>H: confirm and send consent request
+    H->>G: consent request init
+    G->>P: ask the patient
+    P-->>G: grant (maybe fewer record types) or deny
+    G-->>H: consent notification
+    H->>G: fetch artefact
+    G-->>H: artefact: must match what was requested, else refused
+    H->>H: fresh key pair + one-time push token
+    H->>G: health-information request
+    G->>X: request with our public key and push URL
+    X->>H: encrypted bundles → /api/hiu/data-push/{one-time token}
+    H->>H: decrypt, checksum, keep only consented types and dates
+    H->>H: seal originals (AES-GCM, RECORD_SEALING_KEY), pre-checks, background HL7 validation
+    H->>G: transfer notification
+    D->>H: view records (doctors/admins only, every view audited)
+    Note over H: Records are erased at the consent's dataEraseAt or when the patient revokes
+```
+
+### 9. Patient assistant
+
+```mermaid
+flowchart LR
+    REQ["Doctor opens assistant"] --> PERM["Collect only records this user may see<br/>(own approved records; external records<br/>only with hiu:records)"]
+    PERM --> BRIEF["Briefing + timeline + lab trends<br/>(no AI)"]
+    PERM --> Q["Question or summary request"]
+    Q --> KEYQ{"AI configured?"}
+    KEYQ -- no --> NOAI["Says AI is unavailable"]
+    KEYQ -- yes --> LLM["Mistral: answer citing record ids"]
+    LLM --> FILT["Remove citations to records the user<br/>may not see; keep only dates found in records"]
+    FILT --> OUT["Statements labelled 'Documented'<br/>or 'AI interpretation', with sources"]
+```
+
+### 10. Data model (main tables)
+
+```mermaid
+erDiagram
+    hospitals ||--o{ users : employs
+    roles ||--o{ users : grants
+    users ||--o{ user_sessions : "signs in"
+    users |o--o| doctors : "linked profile"
+    hospitals ||--o{ patients : registers
+    patients ||--o{ encounters : has
+    doctors ||--o{ encounters : conducts
+    encounters ||--o{ conditions : diagnoses
+    encounters ||--o{ prescriptions : produces
+    prescriptions ||--|{ prescription_items : contains
+    encounters ||--o{ lab_orders : orders
+    lab_tests ||--o{ lab_orders : "test ordered"
+    lab_orders ||--o| lab_reports : "report"
+    lab_reports ||--|{ lab_results : contains
+    patients ||--o{ clinical_documents : "uploaded for"
+    patients ||--o{ fhir_records : "FHIR bundles"
+    fhir_records ||--o| care_contexts : "shared as"
+    patients ||--o{ hip_patient_links : "ABHA link"
+    patients ||--o{ hip_consents : "HIP consents"
+    patients ||--o{ hiu_consent_requests : "HIU requests"
+    hiu_consent_requests ||--o{ hiu_consent_artefacts : "granted as"
+    hiu_consent_artefacts ||--o{ hiu_data_requests : "data requested"
+    hiu_data_requests ||--o{ retrieved_records : receives
+    hospitals ||--o{ audit_logs : records
+```
+
+`login_failures`, `hip_link_requests`, `hip_transactions`, `term_mappings` and `hiu_patient_summaries` are left
+out of the picture for readability; all 29 tables are listed under [Database](#database-29-tables).
 
 ## Installation (Windows, PowerShell)
 
