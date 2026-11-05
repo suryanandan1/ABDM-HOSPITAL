@@ -50,6 +50,14 @@ class User(Base):
     email: Mapped[str | None] = mapped_column(String(200))
     phone: Mapped[str | None] = mapped_column(String(20))
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    # Bumped on sign-out, password change/reset, role change and deactivation; tokens carry the version they
+    # were issued with, so every older token stops working at once.
+    token_version: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    # Two-step sign-in (TOTP, RFC 6238). The secret is sealed like external records (app.hiu.records.seal); it is
+    # stored during setup and only used for sign-in once mfa_enabled is set. mfa_last_step blocks code replay.
+    mfa_secret: Mapped[str | None] = mapped_column(Text)
+    mfa_enabled: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+    mfa_last_step: Mapped[int | None] = mapped_column(Integer)
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
@@ -63,6 +71,30 @@ class User(Base):
     @property
     def role_name(self) -> str:
         return self.role.name
+
+
+class UserSession(Base):
+    """One sign-in. Tokens name their session, so signing out ends just that one; idle sessions expire."""
+
+    __tablename__ = "user_sessions"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)  # random, carried in the token as "sid"
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    expires_at: Mapped[datetime] = mapped_column(DateTime)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+
+class LoginFailure(Base):
+    """Failed sign-ins, for throttling. Kept in the database so limits hold across restarts and workers."""
+
+    __tablename__ = "login_failures"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    username: Mapped[str] = mapped_column(String(50), index=True)
+    ip_address: Mapped[str] = mapped_column(String(50), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
 
 
 class Doctor(Base):

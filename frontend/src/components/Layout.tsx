@@ -23,6 +23,7 @@ import HubIcon from '@mui/icons-material/Hub'
 import TravelExploreIcon from '@mui/icons-material/TravelExplore'
 import { api, errorMessage } from '../api'
 import { useAuth } from '../auth'
+import MfaSetup from './MfaSetup'
 
 const DRAWER_WIDTH = 240
 
@@ -45,13 +46,15 @@ const NAV = [
 ]
 
 export default function Layout() {
-  const { user, can, logout } = useAuth()
+  const { user, can, logout, logoutEverywhere } = useAuth()
   const navigate = useNavigate()
   const theme = useTheme()
   const isDesktop = useMediaQuery(theme.breakpoints.up('md'))
   const [mobileOpen, setMobileOpen] = useState(false)
   const [menuAnchor, setMenuAnchor] = useState<HTMLElement | null>(null)
   const [passwordOpen, setPasswordOpen] = useState(false)
+  const [mfaOpen, setMfaOpen] = useState(false)
+  const mustSetUpMfa = Boolean(user?.mfa_setup_required)
 
   const drawer = (
     <>
@@ -63,7 +66,7 @@ export default function Layout() {
       </Toolbar>
       <Divider />
       <List sx={{ px: 1 }}>
-        {NAV.filter((item) => can(item.permission)).map((item) => (
+        {NAV.filter((item) => !mustSetUpMfa && can(item.permission)).map((item) => (
           <ListItemButton
             key={item.to}
             component={NavLink}
@@ -100,7 +103,10 @@ export default function Layout() {
           </Button>
           <Menu anchorEl={menuAnchor} open={Boolean(menuAnchor)} onClose={() => setMenuAnchor(null)}>
             <MenuItem onClick={() => { setMenuAnchor(null); setPasswordOpen(true) }}>Change password</MenuItem>
-            <MenuItem onClick={() => { logout(); navigate('/login') }}>Sign out</MenuItem>
+            <MenuItem onClick={() => { setMenuAnchor(null); setMfaOpen(true) }}>Two-step sign-in</MenuItem>
+            <Divider />
+            <MenuItem onClick={() => logout().then(() => navigate('/login'))}>Sign out</MenuItem>
+            <MenuItem onClick={() => logoutEverywhere().then(() => navigate('/login'))}>Sign out everywhere</MenuItem>
           </Menu>
         </Toolbar>
       </AppBar>
@@ -118,10 +124,23 @@ export default function Layout() {
 
       <Box component="main" sx={{ flexGrow: 1, p: { xs: 2, md: 3 }, minWidth: 0 }}>
         <Toolbar className="no-print" />
-        <Outlet />
+        {mustSetUpMfa ? (
+          <Box sx={{ maxWidth: 560 }}>
+            <Typography variant="h5" gutterBottom>Set up two-step sign-in</Typography>
+            <Alert severity="warning" sx={{ mb: 2 }}>Your role requires two-step sign-in. Set it up to continue.</Alert>
+            <MfaSetup />
+          </Box>
+        ) : <Outlet />}
       </Box>
 
       {passwordOpen && <ChangePasswordDialog onClose={() => setPasswordOpen(false)} />}
+      {mfaOpen && (
+        <Dialog open onClose={() => setMfaOpen(false)} maxWidth="xs" fullWidth>
+          <DialogTitle>Two-step sign-in</DialogTitle>
+          <DialogContent><Box sx={{ pt: 1 }}><MfaSetup /></Box></DialogContent>
+          <DialogActions><Button onClick={() => setMfaOpen(false)}>Close</Button></DialogActions>
+        </Dialog>
+      )}
     </Box>
   )
 }
@@ -135,6 +154,7 @@ function ChangePasswordDialog({ onClose }: { onClose: () => void }) {
     if (form.new_password !== form.confirm) return setError('New passwords do not match')
     try {
       await api.post('/auth/change-password', { current_password: form.current_password, new_password: form.new_password })
+      // Changing the password ends every other session; this one continues (the server sets a new session cookie).
       setDone(true)
       setError('')
     } catch (e) {

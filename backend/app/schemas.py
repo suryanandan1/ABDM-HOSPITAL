@@ -102,6 +102,7 @@ class Page(BaseModel, Generic[T]):
 class LoginRequest(BaseModel):
     username: str
     password: str
+    otp: str | None = None  # 6-digit authenticator code, when the user has two-step sign-in
 
 
 class ChangePasswordRequest(BaseModel):
@@ -119,6 +120,7 @@ class UserOut(ORMModel):
     role_code: str
     role_name: str
     hospital_id: int
+    mfa_enabled: bool = False  # two-step sign-in is on
     last_login_at: UTCDateTime | None
     created_at: UTCDateTime
 
@@ -127,12 +129,28 @@ class CurrentUser(UserOut):
     hospital_name: str
     permissions: list[str]
     doctor_id: int | None = None  # linked doctor profile, needed for clinical authoring/approval
+    mfa_setup_required: bool = False  # the role requires two-step sign-in and it is not set up yet
+    session_idle_minutes: int  # the app signs out after this long without activity
 
 
 class TokenResponse(BaseModel):
-    access_token: str
+    access_token: str  # for API clients; the browser uses the HttpOnly session cookie set with this response
     token_type: str = "bearer"
     user: CurrentUser
+
+
+class MfaSetupOut(BaseModel):
+    secret: str  # base32, for typing into the authenticator app
+    otpauth_uri: str  # the same as a link / QR code content
+
+
+class MfaCodeRequest(BaseModel):
+    code: str
+
+
+class MfaDisableRequest(BaseModel):
+    password: str
+    code: str
 
 
 class StaffCreate(BaseModel):

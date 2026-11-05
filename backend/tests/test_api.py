@@ -47,10 +47,56 @@ def test_change_password(client):
     weak = client.post("/api/auth/change-password", headers=headers,
                        json={"current_password": "Demo@1234", "new_password": "short"})
     assert weak.status_code == 422
+    other_session = login(client, "reception")
     ok = client.post("/api/auth/change-password", headers=headers,
                      json={"current_password": "Demo@1234", "new_password": "NewPass123"})
-    assert ok.status_code == 204
+    assert ok.status_code == 200
+    # Every earlier session ends; the session that changed the password continues with its new token.
+    assert client.get("/api/auth/me", headers=headers).status_code == 401
+    assert client.get("/api/auth/me", headers=other_session).status_code == 401
+    fresh = {"Authorization": f"Bearer {ok.json()['access_token']}"}
+    assert client.get("/api/auth/me", headers=fresh).status_code == 200
     login(client, "reception", "NewPass123")
+
+
+def test_logout_ends_only_this_session(client):
+    first, second = login(client, "reception"), login(client, "reception")
+    assert client.post("/api/auth/logout", headers=first).status_code == 204
+    assert client.get("/api/auth/me", headers=first).status_code == 401
+    assert client.get("/api/auth/me", headers=second).status_code == 200  # the other computer stays signed in
+
+
+def test_logout_all_ends_every_session(client):
+    first, second = login(client, "reception"), login(client, "reception")
+    assert client.post("/api/auth/logout-all", headers=first).status_code == 204
+    assert client.get("/api/auth/me", headers=first).status_code == 401
+    assert client.get("/api/auth/me", headers=second).status_code == 401
+    assert client.get("/api/auth/me", headers=login(client, "reception")).status_code == 200
+
+
+def test_staff_changes_revoke_sessions(client, admin):
+    staff = {u["username"]: u["id"] for u in client.get("/api/staff", headers=admin).json()["items"]}
+    reception, labtech = login(client, "reception"), login(client, "labtech")
+    # Editing contact details keeps sessions; a password reset or deactivation ends them.
+    assert client.patch(f"/api/staff/{staff['reception']}", headers=admin, json={"phone": "9876543210"}).status_code == 200
+    assert client.get("/api/auth/me", headers=reception).status_code == 200
+    assert client.patch(f"/api/staff/{staff['reception']}", headers=admin, json={"password": "Reset1234"}).status_code == 200
+    assert client.get("/api/auth/me", headers=reception).status_code == 401
+    assert client.patch(f"/api/staff/{staff['labtech']}", headers=admin, json={"is_active": False}).status_code == 200
+    client.patch(f"/api/staff/{staff['labtech']}", headers=admin, json={"is_active": True})
+    assert client.get("/api/auth/me", headers=labtech).status_code == 401  # reactivation does not revive old tokens
+
+
+def test_token_without_version_is_rejected(client):
+    import jwt
+    from app.config import settings
+    token = jwt.encode({"sub": "1", "hid": 1, "exp": 9999999999}, settings.jwt_secret, algorithm="HS256")
+    assert client.get("/api/auth/me", headers={"Authorization": f"Bearer {token}"}).status_code == 401
+
+
+def test_api_csp_header(client, admin):
+    csp = client.get("/api/auth/me", headers=admin).headers["content-security-policy"]
+    assert "default-src 'none'" in csp and "frame-ancestors 'none'" in csp
 
 
 # ---------- role permissions ----------

@@ -1,19 +1,18 @@
 import axios from 'axios'
 
-export const TOKEN_KEY = 'abdm_token'
-
-export const api = axios.create({ baseURL: '/api' })
-
-api.interceptors.request.use((config) => {
-  const token = localStorage.getItem(TOKEN_KEY)
-  if (token) config.headers.Authorization = `Bearer ${token}`
-  return config
+// The session lives in an HttpOnly cookie that scripts cannot read (so an injected script cannot steal it). Changes
+// also carry the abdm_csrf cookie's value in X-CSRF-Token, which other sites cannot read or send.
+export const api = axios.create({
+  baseURL: '/api',
+  withCredentials: true,
+  xsrfCookieName: 'abdm_csrf',
+  xsrfHeaderName: 'X-CSRF-Token',
 })
 
 api.interceptors.response.use(undefined, (error) => {
-  // Expired or invalid session: drop the token and go back to login.
-  if (error.response?.status === 401 && !error.config.url?.endsWith('/auth/login')) {
-    localStorage.removeItem(TOKEN_KEY)
+  // Expired, idle or revoked session: go back to sign-in (the start-up /auth/me check handles itself).
+  const url: string = error.config?.url ?? ''
+  if (error.response?.status === 401 && !url.startsWith('/auth/') && window.location.pathname !== '/login') {
     window.location.assign('/login')
   }
   return Promise.reject(error)
@@ -57,6 +56,7 @@ export interface User {
   role_code: RoleCode
   role_name: string
   hospital_id: number
+  mfa_enabled: boolean
   last_login_at: string | null
   created_at: string
 }
@@ -65,6 +65,8 @@ export interface CurrentUser extends User {
   hospital_name: string
   permissions: string[]
   doctor_id: number | null
+  mfa_setup_required: boolean
+  session_idle_minutes: number
 }
 
 export interface Role {

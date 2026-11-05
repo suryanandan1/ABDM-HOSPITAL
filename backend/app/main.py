@@ -50,8 +50,13 @@ async def security_headers(request: Request, call_next):
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
     response.headers.setdefault("X-Frame-Options", "DENY")
     response.headers.setdefault("Referrer-Policy", "no-referrer")
+    if request.url.scheme == "https":  # behind a TLS proxy this needs uvicorn --proxy-headers
+        response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
     if request.url.path.startswith("/api/"):
         response.headers.setdefault("Cache-Control", "no-store")  # patient data must not be cached
+        # API responses are data, never pages: if one is opened directly (e.g. an uploaded file), it cannot run
+        # scripts, load anything or be framed.
+        response.headers.setdefault("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'; sandbox")
     return response
 
 

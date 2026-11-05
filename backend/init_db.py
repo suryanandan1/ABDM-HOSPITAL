@@ -1,22 +1,30 @@
-"""Create tables, roles, the first hospital and its administrator.
+"""Migrate the database to the latest schema, then create roles, the first hospital and its administrator.
 
 Usage:
-    python init_db.py            # safe to run repeatedly; only adds what is missing
+    python init_db.py            # safe to run repeatedly; applies new migrations, only adds what is missing
     python init_db.py --demo     # also adds sample staff, doctors and patients
+
+Schema changes are Alembic migrations in migrations/versions (create one with
+`alembic revision --autogenerate -m "..."` after changing app/models.py, then review it).
 """
 
 import sys
 from datetime import date
+from pathlib import Path
 
-from sqlalchemy import select
+from alembic import command
+from alembic.config import Config
+from sqlalchemy import Engine, inspect, select
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.database import Base, SessionLocal, engine
+from app.database import SessionLocal, engine
 from app.models import Doctor, Hospital, LabTest, Patient, Role, User
 from app.security import ROLES, hash_password
 
 DEMO_PASSWORD = "Demo@1234"
+EXAMPLE_ADMIN_PASSWORD = "ChangeMe123"  # the value in .env.example
+BASELINE_REVISION = "0001"  # the schema as created by create_all before migrations existed
 
 # A starter laboratory catalogue (reference ranges are typical adult values; adjust to the lab's own).
 DEMO_LAB_TESTS = [
@@ -111,10 +119,25 @@ def seed_demo(db: Session, hospital: Hospital) -> None:
     print(f"Demo data ready. Demo users: {', '.join(u for u, _, _ in staff)} (password {DEMO_PASSWORD})")
 
 
+def migrate(bind: Engine = engine) -> None:
+    """Bring the database to the latest migration. A database created before migrations existed (tables but no
+    alembic_version) is first marked as being at the baseline, so only the newer migrations run on it."""
+    config = Config(str(Path(__file__).resolve().parent / "alembic.ini"))
+    config.attributes["configure_logger"] = False
+    with bind.begin() as connection:
+        config.attributes["connection"] = connection
+        tables = set(inspect(connection).get_table_names())
+        if "users" in tables and "alembic_version" not in tables:
+            command.stamp(config, BASELINE_REVISION)
+        command.upgrade(config, "head")
+
+
 def main() -> None:
     if not settings.admin_password:
         sys.exit("Set ADMIN_PASSWORD in backend/.env before running init_db.py")
-    Base.metadata.create_all(engine)
+    if settings.admin_password == EXAMPLE_ADMIN_PASSWORD:
+        sys.exit("ADMIN_PASSWORD still has the example value from .env.example; choose a strong password")
+    migrate()
     with SessionLocal() as db:
         hospital = seed(db, settings.hospital_name, settings.hospital_code.upper(),
                         settings.admin_username.lower(), settings.admin_password)

@@ -2,10 +2,11 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
+from app import mfa
 from app.database import get_db
 from app.models import Role, User
 from app.schemas import Page, RoleOut, RoleCode, StaffCreate, StaffUpdate, UserOut
-from app.security import ROLES, hash_password, require
+from app.security import ROLES, hash_password, require, revoke_tokens
 from app.services import audit, changed_fields, get_or_404, paginate
 
 router = APIRouter(tags=["staff"])
@@ -79,7 +80,23 @@ def update_staff(user_id: int, body: StaffUpdate, request: Request,
         changes["role"] = [staff.role_code, role]
         staff.role = role_by_code(db, role)
     changes.update(changed_fields(staff, data))
+    if "password" in changes or "role" in changes or data.get("is_active") is False:
+        revoke_tokens(staff)  # existing sessions must not keep the old password, permissions or access
     if changes:
         audit(db, user, "staff.update", "user", staff.id, {"changes": changes}, request)
         db.commit()
+    return staff
+
+
+@router.delete("/staff/{user_id}/mfa", response_model=UserOut)
+def reset_staff_mfa(user_id: int, request: Request,
+                    user: User = Depends(require("staff:manage")), db: Session = Depends(get_db)):
+    """Turn off a staff member's two-step sign-in (lost phone); they set it up again at their next sign-in."""
+    staff = get_or_404(db, User, user_id, user.hospital_id)
+    if not staff.mfa_enabled and not staff.mfa_secret:
+        raise HTTPException(400, "Two-step sign-in is not set up for this account")
+    mfa.clear(staff)
+    revoke_tokens(staff)
+    audit(db, user, "staff.mfa_reset", "user", staff.id, request=request)
+    db.commit()
     return staff

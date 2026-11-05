@@ -5,6 +5,7 @@ here is derived from it on demand.
 """
 
 import base64
+import hashlib
 import json
 import os
 import re
@@ -26,21 +27,61 @@ SNOMED_TYPES = {"371530004": "OPConsultRecord", "440545006": "PrescriptionRecord
 
 
 # ---------- sealing (encryption at rest) ----------
+# Sealed values look like "v2.<key id>.<base64(nonce + AES-GCM ciphertext)>"; the key id says which
+# RECORD_SEALING_KEY encrypted it, so keys can be rotated (old keys stay readable via RECORD_SEALING_OLD_KEYS,
+# and scripts/reseal_records.py moves everything to the active key). Values without a prefix were sealed with
+# the legacy key derived from JWT_SECRET.
 
-def _key() -> AESGCM:
-    key = HKDF(algorithm=hashes.SHA256(), length=32, salt=b"abdm-hospital-hiu-storage", info=b"v1").derive(
-        settings.jwt_secret.encode())
-    return AESGCM(key)
+SEALED_V2 = "v2"
+
+
+def _derive(secret: str, salt: bytes, info: bytes) -> bytes:
+    return HKDF(algorithm=hashes.SHA256(), length=32, salt=salt, info=info).derive(secret.encode())
+
+
+def _legacy_key() -> bytes:
+    return _derive(settings.jwt_secret, b"abdm-hospital-hiu-storage", b"v1")
+
+
+def _sealing_key(secret: str) -> tuple[str, bytes]:
+    key = _derive(secret, b"abdm-hospital-record-sealing", b"v2")
+    return hashlib.sha256(key).hexdigest()[:12], key
+
+
+class SealingKeyMissing(RuntimeError):
+    """A sealed value names a key that is not configured (neither RECORD_SEALING_KEY nor an old key)."""
+
+
+def active_key_id() -> str | None:
+    return _sealing_key(settings.record_sealing_key)[0] if settings.record_sealing_key else None
 
 
 def seal(text: str) -> str:
     nonce = os.urandom(12)
-    return base64.b64encode(nonce + _key().encrypt(nonce, text.encode(), None)).decode()
+    if not settings.record_sealing_key:  # legacy mode: unchanged format and key
+        return base64.b64encode(nonce + AESGCM(_legacy_key()).encrypt(nonce, text.encode(), None)).decode()
+    key_id, key = _sealing_key(settings.record_sealing_key)
+    body = base64.b64encode(nonce + AESGCM(key).encrypt(nonce, text.encode(), None)).decode()
+    return f"{SEALED_V2}.{key_id}.{body}"
 
 
 def unseal(sealed: str) -> str:
-    raw = base64.b64decode(sealed)
-    return _key().decrypt(raw[:12], raw[12:], None).decode()
+    if sealed.startswith(SEALED_V2 + "."):
+        _, key_id, body = sealed.split(".", 2)
+        secrets = [k for k in [settings.record_sealing_key, *settings.record_sealing_old_key_list] if k]
+        key = next((k for kid, k in map(_sealing_key, secrets) if kid == key_id), None)
+        if key is None:
+            raise SealingKeyMissing(f"Sealed with key {key_id}, which is not configured")
+    else:
+        key, body = _legacy_key(), sealed
+    raw = base64.b64decode(body)
+    return AESGCM(key).decrypt(raw[:12], raw[12:], None).decode()
+
+
+def needs_reseal(sealed: str) -> bool:
+    """True when `sealed` is not encrypted with the active key."""
+    key_id = active_key_id()
+    return key_id is not None and not sealed.startswith(f"{SEALED_V2}.{key_id}.")
 
 
 # ---------- normalised, read-only view ----------

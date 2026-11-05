@@ -6,7 +6,7 @@ Digital Mission (ABDM) under patient consent, both as a **Health Information Pro
 
 | Area | What it does |
 |---|---|
-| Hospital | Hospital profile, staff, doctors, role-based access, audit log |
+| Hospital | Hospital profile, staff, doctors, role-based access, audit log; cookie sessions with idle sign-out and optional two-step sign-in (authenticator app) |
 | Patients | Registration with duplicate checks, search, ABHA identifiers (never trusted until verified) |
 | Clinical | Consultations (vitals, diagnoses), prescriptions with doctor approval, lab catalogue, orders, samples, results, report approval, medical history |
 | AI documents | Upload PDF/scan/image/DOCX/TXT → Mistral OCR + Mistral extracts → staff review every field → doctor approves |
@@ -59,8 +59,13 @@ npm install
 Copy-Item .env.example .env
 ```
 
-`python init_db.py` is safe to re-run: it only creates missing tables and records (there are no migrations yet;
-changed columns need a fresh database).
+`init_db.py` refuses to run while `ADMIN_PASSWORD` in `.env` still has the example value. Upgrading from a version
+before cookie sessions (migration `0003`) signs everyone out once; they simply sign in again.
+
+`python init_db.py` is safe to re-run: it applies new database migrations (Alembic, `backend/migrations`) and only
+adds missing records. Databases created before migrations existed are recognised and upgraded in place. After changing
+`app/models.py`, create a migration with `alembic revision --autogenerate -m "what changed"`, review it, and run
+`python init_db.py` (or `alembic upgrade head`); `tests/test_migrations.py` fails if a model change has no migration.
 
 ## Running
 
@@ -74,10 +79,16 @@ cd E:\project\abdm-hospital\frontend
 npm run dev
 ```
 
-Open http://localhost:5173. API documentation (all 121 operations, try-it-out): http://localhost:8000/docs.
+**Behind a reverse proxy (https)**: run `uvicorn app.main:app --proxy-headers --forwarded-allow-ips=<proxy address>`
+so sign-in throttling sees real client addresses and HSTS is sent. Serve `frontend/dist` with the headers in
+`PRODUCTION_HEADERS` (`frontend/vite.config.ts`: CSP incl. `frame-ancestors 'none'`, `nosniff`, `X-Frame-Options`,
+`Referrer-Policy`) and forward `/api` to the backend; `npm run build; npm run preview` shows the result locally.
+
+Open http://localhost:5173. API documentation (all 127 operations, try-it-out; use *Authorize* with the `access_token` from `/api/auth/login`): http://localhost:8000/docs.
 
 Demo logins (password `Demo@1234`): `dr.mehta`, `dr.rao` (doctors), `reception`, `labtech`, `hims`
-(health information staff); `admin` uses `ADMIN_PASSWORD`.
+(health information staff); `admin` uses `ADMIN_PASSWORD`. Two-step sign-in is off for the demo users unless
+`MFA_REQUIRED_ROLES` names their role; the app signs out after `SESSION_IDLE_MINUTES` (30) without activity.
 
 ## Configuration (`backend/.env`)
 
@@ -85,6 +96,10 @@ Demo logins (password `Demo@1234`): `dr.mehta`, `dr.rao` (doctors), `reception`,
 |---|---|
 | `DATABASE_URL` | SQLAlchemy URL (default SQLite file) |
 | `JWT_SECRET` | ≥32 random characters; the example value is refused at start-up |
+| `JWT_EXPIRE_MINUTES`, `SESSION_IDLE_MINUTES` | Longest a sign-in lasts (480) and how long an unused session survives (30); the browser also signs out after that long without activity |
+| `COOKIE_SECURE` | Session cookie only over https (default `true`; browsers accept it on `http://localhost` too) |
+| `PASSWORD_SCRYPT_N` | scrypt cost for password hashes (default 32768); older hashes are upgraded at the next sign-in |
+| `MFA_REQUIRED_ROLES`, `MFA_ISSUER` | Roles that must use two-step sign-in, e.g. `hospital_admin,doctor` (anyone can opt in); the name shown in authenticator apps |
 | `CORS_ORIGINS` | Frontend origins |
 | `MISTRAL_API_KEY`, `AI_MODEL`, `AI_OCR_MODEL` | Mistral AI for extraction, suggestions, summaries (default `mistral-large-latest`); PDFs and images are read with `mistral-ocr-latest`. Without a key, AI features say so and staff work manually |
 | `UPLOAD_DIR`, `MAX_UPLOAD_MB` | Uploaded documents |
@@ -99,12 +114,21 @@ Demo logins (password `Demo@1234`): `dr.mehta`, `dr.rao` (doctors), `reception`,
 | `ABDM_VERIFY_CALLBACKS` | Verify gateway JWTs on callbacks (keep `true`) |
 | `ABDM_OTP_TEST_DISPLAY` | Sandbox testing only: show linking OTPs when no SMS gateway exists |
 | `HIU_AUTO_VALIDATE` | HL7-validate received bundles in the background |
+| `RECORD_SEALING_KEY`, `RECORD_SEALING_OLD_KEYS` | Key for records received from other providers (sealed at rest), separate from `JWT_SECRET`; earlier keys stay readable during a rotation. After setting or rotating it, run `python scriptseseal_records.py`. Unset = legacy key derived from `JWT_SECRET` |
 
 **ABDM sandbox**: register with NHA (sandbox.abdm.gov.in), register the facility as HIP and HIU services, set the
 `ABDM_*` values, set the hospital's HFR ID to `ABDM_HIP_ID`, expose the backend over https, then on *ABDM HIP →
 Overview* use "Check gateway session" and "Register bridge URL".
 
 ## Workflows
+
+**Sign-in and accounts** – Sign in with username and password (plus a 6-digit code once two-step sign-in is on).
+The account menu (top right) has *Change password*, *Two-step sign-in* (set up: add the shown key or link to an
+authenticator app such as Google/Microsoft Authenticator or FreeOTP, confirm a code; turn off: password + code),
+*Sign out* (this computer) and *Sign out everywhere* (all sessions). Users whose role is in `MFA_REQUIRED_ROLES` see
+only the setup screen until it is done. Lost phone: an administrator opens the user on *Staff* → *Reset two-step
+sign-in*; the user sets it up again at the next sign-in. Five wrong attempts from one computer block that username
+there for 15 minutes.
 
 **Clinical** – Patient → Start consultation → vitals, diagnoses (ICD-10 optional), plan → Finalize. Prescriptions:
 draft → submit → doctor reviews and approves. Lab: order → collect sample → enter results (flags computed) →
@@ -141,7 +165,8 @@ see (others are removed), keep only dates found in those records, and say when i
 ```powershell
 cd E:\project\abdm-hospital\backend; .\.venv\Scripts\Activate.ps1
 pytest                              # everything (about 7–8 minutes; HL7 tests need backend\tools)
-pytest -k "not hl7 and not e2e"     # quick run (about 2 minutes)
+pytest -k "not hl7 and not e2e"     # quick run (about 2–3 minutes)
+pytest tests\test_auth_security.py  # sessions, CSRF, idle timeout, throttling, password hashes, two-step sign-in
 pytest tests\test_e2e.py            # scenarios A–D end to end with the HL7 validator
 python scripts\fhir_conformance.py  # validate one bundle per ABDM record profile
 $env:ABDM_LIVE_CLIENT_ID="SBX_..."; $env:ABDM_LIVE_CLIENT_SECRET="..."; pytest tests\test_hip.py -k live
@@ -159,20 +184,20 @@ real workflows (scenarios A, B, D, retrieved records) are validated in the tests
 
 | Area | State |
 |---|---|
-| Authentication | JWT (HS256, expiring), scrypt password hashes, password policy, sign-in throttling (5 failures / 15 min → 429), equal-cost failures for unknown users |
+| Authentication | Sessions (JWT HS256 naming a server-side session) in an `HttpOnly`, `Secure`, `SameSite=Strict` cookie with a double-submit CSRF token; Bearer tokens for API clients. *Sign out* ends that session, *Sign out everywhere* all of them; changing or resetting a password, a role change or deactivation end every session. Sessions end after `SESSION_IDLE_MINUTES` unused, and the browser signs out after the same time without activity. scrypt password hashes (n=32768, upgraded at sign-in), password policy, equal-cost failures for unknown users. Optional TOTP two-step sign-in (authenticator app; can be required per role, admins can reset it, codes work once, secrets sealed at rest). Throttling stored in the database: 5 failures per username and address, 20 per address, 50 per username in 15 min → 429, so guesses from one computer do not lock the user out elsewhere |
 | Authorization | Permission checks on every endpoint, hospital scoping on every record lookup, separate permission for viewing external records |
 | Secrets | `.env` only (gitignored); example JWT secret refused; ABDM secret, link tokens, keys and OTPs never returned or logged |
 | Logs | Audit log stores ids, field names and counts, not patient details; ABDM transaction log redacted; access logs drop query strings and push tokens |
 | Uploads | Extension allow-list, magic-byte check, size limit, random storage names, served with fixed content types |
 | Callbacks | Gateway JWT verified against ABDM's JWKS plus X-HIP-ID / X-HIU-ID; HIU data push needs a one-time token, closed after use |
 | Consent | HIP shares only within granted, unexpired consent scope; HIU continues only with a validated artefact; data erased on expiry/revocation |
-| Encryption | Fidelius-compatible ECDH/HKDF/AES-GCM (verified against Fidelius test vectors); retrieved records sealed at rest |
-| HTTP | `nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, `Cache-Control: no-store` on the API |
+| Encryption | Fidelius-compatible ECDH/HKDF/AES-GCM (verified against Fidelius test vectors); retrieved records sealed at rest (AES-GCM) with a dedicated, rotatable key; each sealed value names its key id |
+| HTTP | `nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`; `Strict-Transport-Security` on https; on the API `Cache-Control: no-store` and `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'; sandbox`; the production build carries a strict CSP `<meta>` (scripts only from the app itself) |
 | Errors | Plain-language errors; unexpected errors return a generic 500 without internals |
 
-## Database (27 tables)
+## Database (29 tables)
 
-Hospital: `hospitals, roles, users, doctors, patients, audit_logs` · Clinical: `encounters, conditions, prescriptions,
+Hospital: `hospitals, roles, users, user_sessions, login_failures, doctors, patients, audit_logs` · Clinical: `encounters, conditions, prescriptions,
 prescription_items, lab_tests, lab_orders, lab_reports, lab_results` · AI/FHIR: `clinical_documents, fhir_records,
 term_mappings` · HIP: `hip_patient_links, care_contexts, hip_link_requests, hip_consents, hip_transactions` ·
 HIU: `hiu_consent_requests, hiu_consent_artefacts, hiu_data_requests, retrieved_records, hiu_patient_summaries`.
@@ -192,11 +217,12 @@ HIU: `hiu_consent_requests, hiu_consent_artefacts, hiu_data_requests, retrieved_
 - Patient-initiated linking in sandbox needs an SMS gateway (not included).
 - Consent artefact signatures are not verified (no documented consent-manager key); callbacks are authenticated by JWT.
 - Data-push checksum semantics are undocumented; MD5 of the FHIR content is used.
-- No database migrations; SQLite by default; simulator state is in memory.
-- Stored external records are sealed with a key derived from `JWT_SECRET` (rotating it makes them unreadable).
+- SQLite by default; simulator state is in memory.
+- Without `RECORD_SEALING_KEY`, stored external records are sealed with a key derived from `JWT_SECRET` (rotating it
+  would make them unreadable); set the sealing key and run `scriptseseal_records.py` to separate them.
 - HL7 validation takes about a minute per bundle; background validation is not durable across restarts.
 - Medicines have no drug codes (text only); ICD-10 codes need the terminology server for their official display.
 - AI features need `MISTRAL_API_KEY`; documents and questions are then sent to Mistral AI. They were tested with
   fakes only. AI confidence values are model estimates, not calibrated probabilities.
-- Sign-in throttling is per process and can lock a username for 15 minutes; tokens are not revoked on password change.
+- Two-step sign-in shows the setup key and an `otpauth://` link, not a QR code; there are no recovery codes (an administrator resets it).
 - The frontend has no automated UI tests.

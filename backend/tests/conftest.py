@@ -6,6 +6,7 @@ from pathlib import Path
 _db_file = Path(tempfile.mkdtemp()) / "test.db"
 os.environ["DATABASE_URL"] = f"sqlite:///{_db_file.as_posix()}"
 os.environ["JWT_SECRET"] = "test-secret-that-is-long-enough-for-hs256-signing"
+os.environ["PASSWORD_SCRYPT_N"] = "16384"  # the minimum; keeps the many test sign-ins fast
 
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
@@ -30,8 +31,6 @@ def offline_terminology(monkeypatch):
 
 @pytest.fixture()
 def client():
-    from app.routers import auth
-    auth._failures.clear()  # sign-in throttling state is per process
     Base.metadata.drop_all(engine)
     Base.metadata.create_all(engine)
     with SessionLocal() as db:
@@ -43,6 +42,7 @@ def client():
 def login(client, username, password=DEMO_PASSWORD) -> dict:
     response = client.post("/api/auth/login", json={"username": username, "password": password})
     assert response.status_code == 200, response.text
+    client.cookies.clear()  # tests authenticate with the header; the session cookie is tested on its own
     return {"Authorization": f"Bearer {response.json()['access_token']}"}
 
 

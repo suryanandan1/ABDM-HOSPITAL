@@ -60,6 +60,7 @@ export default function Staff() {
                   <TableCell>{formatDateTime(u.last_login_at) || 'Never'}</TableCell>
                   <TableCell>
                     <Chip size="small" label={u.is_active ? 'Active' : 'Inactive'} color={u.is_active ? 'success' : 'default'} />
+                    {u.mfa_enabled && <Chip size="small" variant="outlined" label="2-step" sx={{ ml: 0.5 }} />}
                   </TableCell>
                 </TableRow>
               ))}
@@ -107,6 +108,16 @@ function StaffDialog({ staff, roles, isSelf, onClose, onSaved }: {
     }
   }
 
+  const resetMfa = async () => {
+    if (!staff || !window.confirm(`Turn off two-step sign-in for ${staff.full_name}? They will be signed out.`)) return
+    try {
+      await api.delete(`/staff/${staff.id}/mfa`)
+      onSaved()
+    } catch (e) {
+      setError(errorMessage(e))
+    }
+  }
+
   const selectedRole = roles.find((r) => r.code === form.role)
 
   return (
@@ -134,6 +145,9 @@ function StaffDialog({ staff, roles, isSelf, onClose, onSaved }: {
         </Stack>
       </DialogContent>
       <DialogActions>
+        {staff?.mfa_enabled && !isSelf && (
+          <Button color="warning" onClick={resetMfa} sx={{ mr: 'auto' }}>Reset two-step sign-in</Button>
+        )}
         <Button onClick={onClose}>Cancel</Button>
         <Button variant="contained" onClick={save}>Save</Button>
       </DialogActions>
