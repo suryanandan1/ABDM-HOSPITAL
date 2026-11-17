@@ -21,6 +21,7 @@ import DocumentScannerIcon from '@mui/icons-material/DocumentScanner'
 import DataObjectIcon from '@mui/icons-material/DataObject'
 import HubIcon from '@mui/icons-material/Hub'
 import TravelExploreIcon from '@mui/icons-material/TravelExplore'
+import ApartmentIcon from '@mui/icons-material/Apartment'
 import { api, errorMessage } from '../api'
 import { useAuth } from '../auth'
 import MfaSetup from './MfaSetup'
@@ -28,6 +29,7 @@ import MfaSetup from './MfaSetup'
 const DRAWER_WIDTH = 240
 
 const NAV = [
+  { to: '/network', label: 'Hospitals', icon: <ApartmentIcon />, permission: 'network:manage' },
   { to: '/', label: 'Dashboard', icon: <DashboardIcon />, permission: 'dashboard:view' },
   { to: '/patients', label: 'Patients', icon: <PeopleIcon />, permission: 'patient:read' },
   { to: '/patients/new', label: 'Register Patient', icon: <PersonAddIcon />, permission: 'patient:create' },
@@ -93,7 +95,7 @@ export default function Layout() {
             </IconButton>
           )}
           <Typography variant="h6" noWrap sx={{ flexGrow: 1 }}>
-            {user?.hospital_name}
+            {user?.hospital_name ?? 'All hospitals · network administration'}
           </Typography>
           <Button color="inherit" onClick={(e) => setMenuAnchor(e.currentTarget)} startIcon={<Avatar sx={{ width: 28, height: 28, fontSize: 14, bgcolor: 'primary.main' }}>{user?.full_name[0]}</Avatar>}>
             <Box sx={{ textAlign: 'left', display: { xs: 'none', sm: 'block' } }}>

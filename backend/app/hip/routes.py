@@ -11,7 +11,7 @@ from app.config import settings
 from app.database import get_db
 from app.fhir_validation import validator_available
 from app.hip import gateway, service, simulator
-from app.models import CareContext, HipConsent, HipLinkRequest, HipPatientLink, HipTransaction, Patient, User
+from app.models import CareContext, HipConsent, HipLinkRequest, HipPatientLink, HipTransaction, Hospital, Patient, User
 from app.schemas import ORMModel, Page, PatientSummary, UTCDateTime
 from app.security import require
 from app.services import get_or_404, paginate
@@ -59,6 +59,7 @@ class ConsentOut(ORMModel):
     patient: PatientSummary | None
     abha_address: str | None
     hiu_id: str | None
+    hiu_name: str | None = None  # the requesting hospital, when it is served by this bridge
     purpose: str | None
     hi_types: list
     care_contexts: list
@@ -66,6 +67,22 @@ class ConsentOut(ORMModel):
     date_to: UTCDateTime | None
     data_erase_at: UTCDateTime | None
     created_at: UTCDateTime
+
+
+def facility_names(db: Session, role: str = "hiu") -> dict[str, str]:
+    """ABDM service ID -> hospital name, for the hospitals served by this bridge."""
+    names = {}
+    for hospital in db.scalars(select(Hospital)):
+        facility = gateway.hip_id(hospital) if role == "hip" else gateway.hiu_id(hospital)
+        found = service.hospital_for(db, facility, role) if facility else None
+        if found is not None and found.id == hospital.id:
+            names[facility] = hospital.name
+    return names
+
+
+def consents_out(db: Session, rows) -> list[dict]:
+    names = facility_names(db, "hiu")
+    return [{**ConsentOut.model_validate(c).model_dump(), "hiu_name": names.get(c.hiu_id)} for c in rows]
 
 
 def utc(value: datetime | None) -> str | None:
@@ -94,10 +111,16 @@ def run(action):
 @staff.get("/status")
 def hip_status(user: User = Depends(require("hip:read")), db: Session = Depends(get_db)):
     sandbox = not gateway.simulation()
+    hip_id = gateway.hip_id(user.hospital)
+    owner = service.hospital_for(db, hip_id, "hip") if hip_id else None
+    routable = owner is not None and owner.id == user.hospital_id
     checks = [
         {"label": "Mode", "ok": True, "detail": "Simulation: an in-process stand-in for ABDM (no real data leaves)"
          if not sandbox else f"ABDM sandbox at {settings.abdm_gateway_url} (X-CM-ID {settings.abdm_cm_id})"},
-        {"label": "HIP ID", "ok": bool(gateway.hip_id()), "detail": gateway.hip_id() or "Set ABDM_HIP_ID (facility ID registered as HIP)"},
+        {"label": "HIP ID", "ok": routable,
+         "detail": (f"{hip_id} ({user.hospital.name})" if routable else
+                    f"{hip_id} is shared with another hospital: set this hospital's ABDM HIP ID on the Hospital profile")
+         if hip_id else "Set ABDM_HIP_ID or the hospital's ABDM HIP ID (facility ID registered as HIP)"},
         {"label": "Client credentials", "ok": not sandbox or bool(settings.abdm_client_id and settings.abdm_client_secret),
          "detail": "Not needed in simulation" if not sandbox else
          ("Configured" if settings.abdm_client_id and settings.abdm_client_secret else "Set ABDM_CLIENT_ID and ABDM_CLIENT_SECRET")},
@@ -125,8 +148,22 @@ def hip_status(user: User = Depends(require("hip:read")), db: Session = Depends(
         "pending_transfers": count(HipTransaction, HipTransaction.kind == "health_information", HipTransaction.status == "pending"),
         "failed": count(HipTransaction, HipTransaction.status == "failed"),
     }
-    return {"mode": settings.abdm_mode, "hip_id": gateway.hip_id(), "checks": checks, "counts": counts,
-            "ready": all(c["ok"] for c in checks if c["label"] != "FHIR validator")}
+    return {"mode": settings.abdm_mode, "hip_id": hip_id, "hiu_id": gateway.hiu_id(user.hospital), "checks": checks,
+            "counts": counts, "ready": all(c["ok"] for c in checks if c["label"] != "FHIR validator")}
+
+
+@staff.get("/network")
+def network(user: User = Depends(require("hip:read")), db: Session = Depends(get_db)):
+    """The hospitals this bridge serves and their ABDM IDs (a directory: names and IDs only, no patient data)."""
+    hips, hius = facility_names(db, "hip"), facility_names(db, "hiu")
+    rows = []
+    for h in db.scalars(select(Hospital).where(Hospital.is_active.is_(True)).order_by(Hospital.id)):
+        hip_id, hiu_id = gateway.hip_id(h), gateway.hiu_id(h)
+        rows.append({"id": h.id, "name": h.name, "code": h.code, "city": h.city, "state": h.state,
+                     "hip_id": hip_id if hips.get(hip_id) == h.name else None,
+                     "hiu_id": hiu_id if hius.get(hiu_id) == h.name else None,
+                     "this_hospital": h.id == user.hospital_id})
+    return {"mode": settings.abdm_mode, "hospitals": rows}
 
 
 @staff.post("/session-check")
@@ -177,8 +214,8 @@ def patient_overview(patient_id: int, user: User = Depends(require("hip:read")),
         "link_requests": [{"link_reference": r.link_reference, "status": r.status, "abha_address": r.abha_address,
                            "care_contexts": r.care_context_refs, "mode": r.mode, "expires_at": utc(r.otp_expires_at),
                            "test_otp": r.test_otp if show_otp and r.status == "otp_sent" else None} for r in requests],
-        "consents": [ConsentOut.model_validate(c).model_dump() for c in db.scalars(
-            select(HipConsent).where(HipConsent.patient_id == patient.id).order_by(HipConsent.id.desc()))],
+        "consents": consents_out(db, db.scalars(
+            select(HipConsent).where(HipConsent.patient_id == patient.id).order_by(HipConsent.id.desc()))),
     }
 
 
@@ -220,7 +257,8 @@ def list_consents(status: str | None = None, page: int = Query(1, ge=1), page_si
     query = select(HipConsent).where(HipConsent.hospital_id == user.hospital_id).order_by(HipConsent.id.desc())
     if status:
         query = query.where(HipConsent.status == status)
-    return paginate(db, query, page, page_size)
+    result = paginate(db, query, page, page_size)
+    return {**result, "items": consents_out(db, result["items"])}
 
 
 @staff.get("/transactions", response_model=Page[TransactionOut])
@@ -262,7 +300,8 @@ def simulate_abha(body: SimAbha, _: User = Depends(simulation_only)):
 def simulate_discover(patient_id: int, abha_address: str = Body(embed=True), user: User = Depends(simulation_only),
                       db: Session = Depends(get_db)):
     p = get_or_404(db, Patient, patient_id, user.hospital_id)
-    return simulator.discover(abha_address.lower(), p.full_name, p.gender, p.year_of_birth, p.mobile)
+    return simulator.discover(abha_address.lower(), p.full_name, p.gender, p.year_of_birth, p.mobile,
+                              hip_id=gateway.hip_id(user.hospital))
 
 
 class SimLink(BaseModel):
@@ -273,7 +312,8 @@ class SimLink(BaseModel):
 
 @staff.post("/simulate/link-init")
 def simulate_link_init(body: SimLink, user: User = Depends(simulation_only), db: Session = Depends(get_db)):
-    reply = simulator.link_init(body.transaction_id, body.abha_address.lower(), body.patient)
+    reply = simulator.link_init(body.transaction_id, body.abha_address.lower(), body.patient,
+                                hip_id=gateway.hip_id(user.hospital))
     request = db.scalar(select(HipLinkRequest).where(HipLinkRequest.link_reference == ((reply or {}).get("link") or {}).get("referenceNumber")))
     return {"response": reply, "sms_to_patient": simulator.phone.get(db.get(Patient, request.patient_id).mobile) if request else None}
 
@@ -284,8 +324,8 @@ class SimConfirm(BaseModel):
 
 
 @staff.post("/simulate/link-confirm")
-def simulate_link_confirm(body: SimConfirm, _: User = Depends(simulation_only)):
-    return simulator.link_confirm(body.link_reference, body.otp)
+def simulate_link_confirm(body: SimConfirm, user: User = Depends(simulation_only)):
+    return simulator.link_confirm(body.link_reference, body.otp, hip_id=gateway.hip_id(user.hospital))
 
 
 class SimConsent(BaseModel):
@@ -311,7 +351,7 @@ def simulate_consent(body: SimConsent, user: User = Depends(simulation_only), db
                                    body.hi_types or sorted({c.hi_type for c in contexts}),
                                    f"{body.date_from}T00:00:00.000Z", f"{body.date_to}T23:59:59.000Z",
                                    body.erase_at.isoformat() + ("Z" if body.erase_at.tzinfo is None else ""),
-                                   body.status, body.consent_id)
+                                   body.status, body.consent_id, to_hip=gateway.hip_id(user.hospital))
 
 
 class SimRequest(BaseModel):
@@ -321,9 +361,9 @@ class SimRequest(BaseModel):
 
 
 @staff.post("/simulate/health-information")
-def simulate_health_information(body: SimRequest, _: User = Depends(simulation_only)):
+def simulate_health_information(body: SimRequest, user: User = Depends(simulation_only)):
     return simulator.request_health_information(body.consent_id, f"{body.date_from}T00:00:00.000Z",
-                                                f"{body.date_to}T23:59:59.000Z")
+                                                f"{body.date_to}T23:59:59.000Z", hip_id=gateway.hip_id(user.hospital))
 
 
 # ---------- ABDM callbacks (bridge URL + these paths) ----------
@@ -340,13 +380,14 @@ REQUIRED = {
 HIP_ADDRESSED = {"discover", "link_init", "link_confirm", "consent_notify", "health_information"}
 
 
-def accept(kind: str, required: list[str] | None = None, handler=None, id_header: str | None = None, expected_id=None):
-    """A callback endpoint: verify the gateway JWT and the addressed HIP/HIU id, check required fields, answer 202
-    and process afterwards. Shared by the HIP and HIU callbacks."""
+def accept(kind: str, required: list[str] | None = None, handler=None, role: str | None = None):
+    """A callback endpoint: verify the gateway JWT and that the addressed HIP/HIU id belongs to one of this bridge's
+    hospitals, check required fields, answer 202 and process afterwards. Shared by the HIP and HIU callbacks."""
     required = REQUIRED[kind] if required is None else required
     handler = handler or service.handle_inbound
-    if id_header is None and kind in HIP_ADDRESSED:
-        id_header, expected_id = "x-hip-id", gateway.hip_id
+    if role is None and kind in HIP_ADDRESSED:
+        role = "hip"
+    id_header = {"hip": "x-hip-id", "hiu": "x-hiu-id"}.get(role)
 
     async def endpoint(request: Request, background: BackgroundTasks, db: Session = Depends(get_db)):
         try:
@@ -355,15 +396,15 @@ def accept(kind: str, required: list[str] | None = None, handler=None, id_header
             raise HTTPException(400, "Body must be JSON")
         try:
             gateway.verify_callback(request.headers.get("authorization"))
-            if id_header and request.headers.get(id_header) != expected_id():
-                raise gateway.CallbackAuthError(f"{id_header.upper()} does not match this facility")
+            if id_header and not (request.headers.get(id_header)
+                                  and service.hospital_for(db, request.headers.get(id_header), role)):
+                raise gateway.CallbackAuthError(f"{id_header.upper()} does not match any facility of this bridge")
         except gateway.CallbackAuthError as exc:
-            try:
-                service.record(db, service.hip_hospital(db).id, "callback_rejected", "inbound", "failed",
-                               f"{kind}: {exc}", request_id=request.headers.get("request-id"))
+            hospital = service.hospital_for(db, None, role or "hip")
+            if hospital is not None:  # with several hospitals and no match, there is no one to log it for
+                service.record(db, hospital.id, "callback_rejected", "inbound", "failed", f"{kind}: {exc}",
+                               request_id=request.headers.get("request-id"))
                 db.commit()
-            except service.HipError:
-                pass
             raise HTTPException(401, "Callback authentication failed")
         for path in required:
             node = body

@@ -8,6 +8,7 @@ import PrintIcon from '@mui/icons-material/Print'
 import { api, errorMessage, formatDateTime, formatRange, LabOrder, LabResult } from '../api'
 import { useAuth } from '../auth'
 import { FhirButton, PatientBanner, ReasonDialog, StatusChip } from '../components/clinical'
+import { useActions } from '../useActions'
 
 const FLAG: Record<string, { label: string; color: 'success' | 'error' | 'warning' }> = {
   N: { label: 'Normal', color: 'success' }, L: { label: 'Low', color: 'warning' },
@@ -23,8 +24,6 @@ export default function LabOrderPage() {
   const [conclusion, setConclusion] = useState('')
   const [sample, setSample] = useState({ sample_barcode: '', notes: '' })
   const [dialog, setDialog] = useState<'cancel' | 'reject-sample' | 'reject-report' | null>(null)
-  const [message, setMessage] = useState('')
-  const [error, setError] = useState('')
 
   const load = (o: LabOrder) => {
     setOrder(o)
@@ -34,6 +33,7 @@ export default function LabOrderPage() {
     }])))
     setConclusion(o.report?.conclusion ?? '')
   }
+  const { message, setMessage, error, setError, act } = useActions(load)
   useEffect(() => {
     api.get<LabOrder>(`/lab/orders/${id}`).then((r) => load(r.data)).catch((e) => setError(errorMessage(e)))
   }, [id])
@@ -45,16 +45,6 @@ export default function LabOrderPage() {
     (!report || ['draft', 'rejected'].includes(report.status))
   const canApprove = can('lab:approve') && Boolean(user?.doctor_id) && report?.status === 'pending_approval'
 
-  const act = async (request: () => Promise<{ data: LabOrder }>, success: string) => {
-    try {
-      load((await request()).data)
-      setMessage(success)
-      setError('')
-    } catch (e) {
-      setError(errorMessage(e))
-      throw e
-    }
-  }
   const saveResults = () => api.put<LabOrder>(`/lab/orders/${id}/report`, {
     conclusion: conclusion || null,
     results: order.test.parameters.map((p) => ({

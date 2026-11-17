@@ -1,17 +1,18 @@
 import { Fragment, useEffect, useState } from 'react'
 import {
-  Alert, Box, Button, Checkbox, Chip, Collapse, Grid2 as Grid, IconButton, LinearProgress, MenuItem, Paper, Stack, Tab,
-  Table, TableBody, TableCell, TableHead, TablePagination, TableRow, Tabs, TextField, Typography,
+  Alert, Box, Button, Checkbox, Chip, Collapse, IconButton, LinearProgress, MenuItem, Paper, Stack,
+  Table, TableBody, TableCell, TableHead, TablePagination, TableRow, TextField, Typography,
 } from '@mui/material'
 import ExpandMoreIcon from '@mui/icons-material/ExpandMore'
 import CheckCircleIcon from '@mui/icons-material/CheckCircle'
 import ErrorIcon from '@mui/icons-material/Error'
 import {
   api, CareContextRow, errorMessage, formatDateTime, HipConsentRow, HipPatientOverview, HipStatus, HipTransactionRow,
-  PatientSummary,
+  NetworkHospital, PatientSummary,
 } from '../api'
 import { useAuth } from '../auth'
 import { PatientBanner, PatientPicker } from '../components/clinical'
+import { DataTable, FilterTabs, StatTiles } from '../components/ui'
 import { usePaged } from '../usePaged'
 
 const KIND_LABEL: Record<string, string> = {
@@ -48,13 +49,8 @@ export default function Hip() {
         directly to the requesting provider when the patient has granted consent.
       </Alert>
       <Paper>
-        <Tabs value={tab} onChange={(_, v) => setTab(v)} variant="scrollable" sx={{ px: 1, borderBottom: '1px solid #e3e7ed' }}>
-          <Tab label="Overview" />
-          <Tab label="Patients & linking" />
-          <Tab label="Care contexts" />
-          <Tab label="Requests & consents" />
-          <Tab label="Transaction log" />
-        </Tabs>
+        <FilterTabs labels={['Overview', 'Patients & linking', 'Care contexts', 'Requests & consents', 'Transaction log']}
+          value={tab} onChange={setTab} />
         <Box sx={{ p: 2 }}>
           {tab === 0 && <Overview status={status} onChange={loadStatus} />}
           {tab === 1 && <PatientLinking mode={status?.mode} onChange={loadStatus} />}
@@ -70,6 +66,10 @@ export default function Hip() {
 function Overview({ status, onChange }: { status: HipStatus | null; onChange: () => void }) {
   const { can } = useAuth()
   const [message, setMessage] = useState<{ ok: boolean; text: string } | null>(null)
+  const [network, setNetwork] = useState<NetworkHospital[]>([])
+  useEffect(() => {
+    api.get<{ hospitals: NetworkHospital[] }>('/hip/network').then((r) => setNetwork(r.data.hospitals)).catch(() => undefined)
+  }, [])
   if (!status) return <LinearProgress />
   const act = (path: string) => api.post<{ status: string; message: string }>(path)
     .then((r) => { setMessage({ ok: r.data.status === 'success', text: r.data.message }); onChange() })
@@ -94,16 +94,23 @@ function Overview({ status, onChange }: { status: HipStatus | null; onChange: ()
           ))}
         </TableBody>
       </Table>
-      <Grid container spacing={1.5}>
-        {tiles.map(([label, value]) => (
-          <Grid key={label} size={{ xs: 6, md: 3 }}>
-            <Paper variant="outlined" sx={{ p: 1.5 }}>
-              <Typography variant="h6">{value ?? 0}</Typography>
-              <Typography variant="body2" color="text.secondary">{label}</Typography>
-            </Paper>
-          </Grid>
-        ))}
-      </Grid>
+      <StatTiles tiles={tiles} />
+      {network.length > 1 && (
+        <Box>
+          <Typography variant="subtitle1" fontWeight={600}>Hospitals on this ABDM bridge</Typography>
+          <Typography variant="body2" color="text.secondary" mb={1}>
+            Each hospital is its own HIP (shares its records) and HIU (requests records). A patient has one ABHA address
+            (e.g. surya@abdm) at every hospital; records linked to it at one hospital can be requested by the others with the patient's consent.
+          </Typography>
+          <DataTable rows={network} columns={[
+            ['Hospital', (h) => <>{h.name} {h.this_hospital && <Chip size="small" color="primary" label="this hospital" />}</>],
+            ['Code', (h) => h.code],
+            ['Location', (h) => [h.city, h.state].filter(Boolean).join(', ')],
+            ['HIP ID', (h) => h.hip_id ?? <Typography variant="caption" color="error">not set</Typography>],
+            ['HIU ID', (h) => h.hiu_id ?? <Typography variant="caption" color="error">not set</Typography>],
+          ]} />
+        </Box>
+      )}
       {can('hip:configure') && (
         <Stack direction="row" spacing={1}>
           <Button variant="outlined" onClick={() => act('/hip/session-check')}>Check gateway session</Button>
@@ -238,36 +245,22 @@ function CareContextTable({ rows, selected = [], onSelect }: { rows: CareContext
 
 function ConsentTable({ rows }: { rows: HipConsentRow[] }) {
   if (!rows.length) return <Typography color="text.secondary">No consents received.</Typography>
-  return (
-    <Box sx={{ overflowX: 'auto' }}>
-      <Table size="small">
-        <TableHead>
-          <TableRow><TableCell>Status</TableCell><TableCell>Patient</TableCell><TableCell>HIU</TableCell><TableCell>Types</TableCell>
-            <TableCell>Records</TableCell><TableCell>Period</TableCell><TableCell>Erase at</TableCell><TableCell>Note</TableCell></TableRow>
-        </TableHead>
-        <TableBody>
-          {rows.map((c) => (
-            <TableRow key={c.consent_id}>
-              <TableCell><Chip size="small" label={c.status} color={LINK_COLOR[c.status]} /> <ModeChip mode={c.mode} /></TableCell>
-              <TableCell>{c.patient?.full_name ?? c.abha_address}</TableCell>
-              <TableCell>{c.hiu_id}<Typography variant="caption" display="block">{c.purpose}</Typography></TableCell>
-              <TableCell>{c.hi_types.join(', ')}</TableCell>
-              <TableCell>{c.care_contexts.length}</TableCell>
-              <TableCell sx={{ whiteSpace: 'nowrap' }}>{c.date_from ? `${formatDateTime(c.date_from)} – ${formatDateTime(c.date_to)}` : '—'}</TableCell>
-              <TableCell>{formatDateTime(c.data_erase_at)}</TableCell>
-              <TableCell sx={{ maxWidth: 240 }}>{c.status_reason}</TableCell>
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
-    </Box>
-  )
+  return <DataTable rows={rows} rowKey={(c) => c.consent_id} columns={[
+    ['Status', (c) => <><Chip size="small" label={c.status} color={LINK_COLOR[c.status]} /> <ModeChip mode={c.mode} /></>],
+    ['Patient', (c) => <>{c.patient?.full_name ?? '—'}<Typography variant="caption" display="block">{c.abha_address}</Typography></>],
+    ['Requested by (HIU)', (c) => <>{c.hiu_name ?? c.hiu_id}<Typography variant="caption" display="block">{c.hiu_name ? `${c.hiu_id} · ` : ''}{c.purpose}</Typography></>],
+    ['Types', (c) => c.hi_types.join(', ')],
+    ['Records', (c) => c.care_contexts.length],
+    ['Period', (c) => (c.date_from ? `${formatDateTime(c.date_from)} – ${formatDateTime(c.date_to)}` : '—'), { whiteSpace: 'nowrap' }],
+    ['Erase at', (c) => formatDateTime(c.data_erase_at)],
+    ['Note', (c) => c.status_reason, { maxWidth: 240 }],
+  ]} />
 }
 
 /** Simulated ABDM, ABHA app and HIU (simulation mode only), to exercise every HIP workflow end to end. */
 function Simulator({ overview, onDone }: { overview: HipPatientOverview; onDone: (text: string, ok?: boolean) => void }) {
   const p = overview.patient
-  const [abha, setAbha] = useState(p.abha_address ?? `${p.full_name.toLowerCase().replace(/[^a-z]/g, '.')}@sbx`)
+  const [abha, setAbha] = useState(p.abha_address ?? `${p.full_name.toLowerCase().replace(/[^a-z]/g, '.')}@abdm`)
   const [discovered, setDiscovered] = useState<{ transactionId: string; patient: any[] } | null>(null)
   const [link, setLink] = useState<{ reference: string; otp: string } | null>(null)
   const [consentId, setConsentId] = useState('')
@@ -432,7 +425,7 @@ function TransactionTable({ kind, status }: { kind: string; status: string }) {
                   <TableCell sx={{ whiteSpace: 'nowrap' }}>{formatDateTime(t.created_at)}</TableCell>
                   <TableCell>{KIND_LABEL[t.kind] ?? t.kind} <Typography variant="caption" display="block">{t.direction} · <ModeChip mode={t.mode} /></Typography></TableCell>
                   <TableCell><Chip size="small" label={t.status} color={STATUS_COLOR[t.status]} /></TableCell>
-                  <TableCell>{t.patient?.full_name ?? '—'}</TableCell>
+                  <TableCell>{t.patient?.full_name ?? '—'}{t.patient?.abha_address && <Typography variant="caption" display="block">{t.patient.abha_address}</Typography>}</TableCell>
                   <TableCell sx={{ maxWidth: 420 }}>{t.message}</TableCell>
                 </TableRow>
                 <TableRow>

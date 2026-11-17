@@ -6,7 +6,7 @@ from app.database import get_db
 from app.models import Encounter, LabOrder, LabReport, LabResult, LabTest, User, utcnow
 from app.schemas import LabOrderCreate, LabOrderOut, LabReportIn, LabTestIn, LabTestOut, Page, ReasonRequest, SampleCollect
 from app.security import require
-from app.services import audit, current_doctor, get_or_404, mark_approved, paginate, require_status
+from app.services import audit, commit, current_doctor, get_or_404, mark_approved, paginate, require_status
 
 router = APIRouter(prefix="/lab", tags=["laboratory"])
 
@@ -195,9 +195,7 @@ def save_results(order_id: int, body: LabReportIn, request: Request, user: User 
     audit(db, user, "lab_report.save", "lab_order", order.id,
           {"entered": len(results), "abnormal": [r.code for r in results if r.interpretation not in (None, "N")]},
           request)
-    db.commit()
-    db.refresh(order)
-    return order
+    return commit(db, order)
 
 
 @router.post("/orders/{order_id}/report/submit", response_model=LabOrderOut)

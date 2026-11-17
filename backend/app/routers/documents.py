@@ -19,7 +19,8 @@ from app.models import ClinicalDocument, Doctor, FhirRecord, Patient, TermMappin
 from app.routers.fhir import store_record
 from app.schemas import DocumentOut, DocumentSummary, DocumentUpdate, LoincAction, Page, ReasonRequest
 from app.security import require
-from app.services import audit, current_doctor, get_or_404, mark_approved, name_similarity, paginate, require_status
+from app.services import (audit, commit, current_doctor, get_or_404, mark_approved, name_similarity, paginate,
+                          require_status)
 
 router = APIRouter(tags=["documents"])
 log = logging.getLogger(__name__)
@@ -280,9 +281,7 @@ def save_review(document_id: int, body: DocumentUpdate, request: Request,
         doc.data = record.model_dump(mode="json")
     doc.status = "draft"
     audit(db, user, "document.review", "document", doc.id, {"changed": changes}, request)
-    db.commit()
-    db.refresh(doc)
-    return document_out(db, doc)
+    return document_out(db, commit(db, doc))
 
 
 @router.post("/documents/{document_id}/lab-results/{index}/loinc", response_model=DocumentOut)

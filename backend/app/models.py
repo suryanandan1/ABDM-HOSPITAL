@@ -1,6 +1,6 @@
 from datetime import date, datetime, timezone
 
-from sqlalchemy import JSON, Boolean, Date, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import JSON, Boolean, Date, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, declared_attr, mapped_column, relationship
 
 from app.database import Base
@@ -13,11 +13,18 @@ def utcnow() -> datetime:
 
 class Hospital(Base):
     __tablename__ = "hospitals"
+    # unique indexes, not constraints: SQLite can add these without rebuilding the table (migration 0004)
+    __table_args__ = (Index("uq_hospitals_abdm_hip_id", "abdm_hip_id", unique=True),
+                      Index("uq_hospitals_abdm_hiu_id", "abdm_hiu_id", unique=True))
 
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(200))
     code: Mapped[str] = mapped_column(String(20), unique=True)  # prefix for patient IDs
     hfr_id: Mapped[str | None] = mapped_column(String(50), unique=True)  # ABDM Health Facility Registry ID
+    # ABDM service IDs of this hospital (one bridge can serve several facilities). When unset, the hospital uses
+    # ABDM_HIP_ID / ABDM_HIU_ID from the environment, which only works while a single hospital has no own IDs.
+    abdm_hip_id: Mapped[str | None] = mapped_column(String(50))
+    abdm_hiu_id: Mapped[str | None] = mapped_column(String(50))
     facility_type: Mapped[str | None] = mapped_column(String(100))
     address: Mapped[str | None] = mapped_column(String(300))
     city: Mapped[str | None] = mapped_column(String(100))
@@ -42,7 +49,8 @@ class User(Base):
     __tablename__ = "users"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    hospital_id: Mapped[int] = mapped_column(ForeignKey("hospitals.id"), index=True)
+    # None only for network administrators, who manage every hospital and belong to none
+    hospital_id: Mapped[int | None] = mapped_column(ForeignKey("hospitals.id"), index=True)
     role_id: Mapped[int] = mapped_column(ForeignKey("roles.id"))
     username: Mapped[str] = mapped_column(String(50), unique=True)
     password_hash: Mapped[str] = mapped_column(String(300))
@@ -61,7 +69,7 @@ class User(Base):
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
-    hospital: Mapped[Hospital] = relationship(lazy="joined")
+    hospital: Mapped[Hospital | None] = relationship(lazy="joined")
     role: Mapped[Role] = relationship(lazy="joined")
 
     @property
@@ -619,6 +627,7 @@ class HiuConsentRequest(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, index=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
 
+    hospital: Mapped[Hospital] = relationship()
     patient: Mapped[Patient] = relationship()
     requester_doctor: Mapped[Doctor] = relationship()
     artefacts: Mapped[list["HiuConsentArtefact"]] = relationship(back_populates="consent_request",

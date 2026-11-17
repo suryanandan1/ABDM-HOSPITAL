@@ -55,14 +55,14 @@ export interface User {
   is_active: boolean
   role_code: RoleCode
   role_name: string
-  hospital_id: number
+  hospital_id: number | null // null: network administrator (manages every hospital, belongs to none)
   mfa_enabled: boolean
   last_login_at: string | null
   created_at: string
 }
 
 export interface CurrentUser extends User {
-  hospital_name: string
+  hospital_name: string | null
   permissions: string[]
   doctor_id: number | null
   mfa_setup_required: boolean
@@ -81,6 +81,8 @@ export interface Hospital {
   name: string
   code: string
   hfr_id: string | null
+  abdm_hip_id: string | null
+  abdm_hiu_id: string | null
   facility_type: string | null
   address: string | null
   city: string | null
@@ -89,6 +91,13 @@ export interface Hospital {
   phone: string | null
   email: string | null
   created_at: string
+}
+
+/** A hospital as the network administrator sees it: profile, status, counts (no patient data) and its admins. */
+export interface ManagedHospital extends Hospital {
+  is_active: boolean
+  stats: { staff: number; active_staff: number; doctors: number; patients: number; shared_records: number }
+  admins: { id: number; username: string; full_name: string; is_active: boolean }[]
 }
 
 export interface Doctor {
@@ -437,9 +446,21 @@ export interface FhirRecord {
 export interface HipStatus {
   mode: 'simulation' | 'sandbox'
   hip_id: string | null
+  hiu_id: string | null
   ready: boolean
   checks: { label: string; ok: boolean; detail: string }[]
   counts: Record<string, number>
+}
+
+export interface NetworkHospital {
+  id: number
+  name: string
+  code: string
+  city: string | null
+  state: string | null
+  hip_id: string | null
+  hiu_id: string | null
+  this_hospital: boolean
 }
 
 export interface CareContextRow {
@@ -481,6 +502,7 @@ export interface HipConsentRow {
   patient: PatientSummary | null
   abha_address: string | null
   hiu_id: string | null
+  hiu_name: string | null
   purpose: string | null
   hi_types: string[]
   care_contexts: { patientReference: string; careContextReference: string }[]

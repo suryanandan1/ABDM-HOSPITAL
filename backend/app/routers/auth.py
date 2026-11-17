@@ -10,7 +10,8 @@ from app.database import get_db
 from app.models import Doctor, LoginFailure, User, utcnow
 from app.schemas import (ChangePasswordRequest, CurrentUser, LoginRequest, MfaCodeRequest, MfaDisableRequest,
                          MfaSetupOut, TokenResponse, UserOut)
-from app.security import (clear_session_cookies, create_session, end_session, get_session_user, hash_password,
+from app.security import (can_sign_in, clear_session_cookies, create_session, end_session, get_session_user,
+                          hash_password,
                           mfa_setup_required, needs_rehash, permissions_for, revoke_tokens, set_session_cookies,
                           verify_password)
 from app.services import audit
@@ -49,7 +50,7 @@ def note_failure(db: Session, username: str, ip: str) -> None:
 def current_user_out(user: User) -> CurrentUser:
     return CurrentUser(
         **UserOut.model_validate(user).model_dump(),
-        hospital_name=user.hospital.name,
+        hospital_name=user.hospital.name if user.hospital else None,  # None: network administrator
         permissions=sorted(permissions_for(user)),
         doctor_id=object_session(user).scalar(
             select(Doctor.id).where(Doctor.user_id == user.id, Doctor.is_active.is_(True))),
@@ -80,7 +81,7 @@ def login(body: LoginRequest, request: Request, response: Response, db: Session 
               request=request, hospital_id=user.hospital_id if user else None)
         db.commit()
         raise HTTPException(401, "Invalid username or password")
-    if not user.is_active or not user.hospital.is_active:
+    if not can_sign_in(user):
         raise HTTPException(403, "This account is disabled. Contact your hospital administrator.")
     if user.mfa_enabled:
         if not body.otp:

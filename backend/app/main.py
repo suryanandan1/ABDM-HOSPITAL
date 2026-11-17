@@ -7,8 +7,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
 from app.hip import routes as hip_routes
 from app.hiu import routes as hiu_routes
-from app.routers import (assistant, auth, consultations, dashboard, doctors, documents, fhir, hospital, lab, patients,
-                         prescriptions, staff)
+from app.routers import (assistant, auth, consultations, dashboard, doctors, documents, fhir, hospital, lab, network,
+                         patients, prescriptions, staff)
 
 app = FastAPI(title="ABDM Hospital Platform API", version="0.1.0")
 
@@ -20,7 +20,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-for module in (auth, hospital, staff, doctors, patients, dashboard, consultations, prescriptions, lab, fhir, documents,
+for module in (auth, hospital, network, staff, doctors, patients, dashboard, consultations, prescriptions, lab, fhir, documents,
                assistant):
     app.include_router(module.router, prefix="/api")
 # HIP: staff API and the ABDM callback paths (served under the bridge URL, e.g. https://host/api/v3/hip/...)

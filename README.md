@@ -20,7 +20,7 @@ Digital Mission (ABDM) under patient consent, both as a **Health Information Pro
 
 **Contents**: [Architecture](#architecture) · [Screenshots](#screenshots) · [Flow diagrams](#flow-diagrams) ·
 [Installation](#installation-windows-powershell) · [Running](#running) · [Configuration](#configuration-backendenv) ·
-[Workflows](#workflows) · [Testing](#testing) · [Security review](#security-review-phase-6) ·
+[Several hospitals](#several-hospitals-abdm-network) · [Workflows](#workflows) · [Testing](#testing) · [Security review](#security-review-phase-6) ·
 [Database](#database-29-tables) · [Integration status](#integration-status-and-simulated-features) ·
 [Known limitations](#known-limitations)
 
@@ -439,7 +439,9 @@ pip install -r requirements.txt
 Copy-Item .env.example .env
 python -c "import secrets; print(secrets.token_urlsafe(48))"   # paste as JWT_SECRET in .env; set ADMIN_PASSWORD
 powershell -ExecutionPolicy Bypass -File scripts\setup_validator.ps1   # Java 21 + HL7 validator + IG into backend\tools
-python init_db.py --demo          # tables, roles, hospital, admin, demo staff/doctors/patients/lab catalogue
+python init_db.py --demo          # tables, roles, 3 demo hospitals, admin, staff/doctors/patients/lab catalogues
+python scripts\seed_shared_records.py   # optional: records to exchange between the hospitals (about 5 minutes)
+python scripts\create_network_admin.py  # optional: "superadmin", who manages every hospital (asks for a password)
 
 cd ..\frontend
 npm install
@@ -471,11 +473,41 @@ so sign-in throttling sees real client addresses and HSTS is sent. Serve `fronte
 `PRODUCTION_HEADERS` (`frontend/vite.config.ts`: CSP incl. `frame-ancestors 'none'`, `nosniff`, `X-Frame-Options`,
 `Referrer-Policy`) and forward `/api` to the backend; `npm run build; npm run preview` shows the result locally.
 
-Open http://localhost:5173. API documentation (all 127 operations, try-it-out; use *Authorize* with the `access_token` from `/api/auth/login`): http://localhost:8000/docs.
+Open http://localhost:5173. API documentation (all 137 operations, try-it-out; use *Authorize* with the `access_token` from `/api/auth/login`): http://localhost:8000/docs.
 
-Demo logins (password `Demo@1234`): `dr.mehta`, `dr.rao` (doctors), `reception`, `labtech`, `hims`
-(health information staff); `admin` uses `ADMIN_PASSWORD`. Two-step sign-in is off for the demo users unless
+Demo logins (password `Demo@1234`), one set per hospital (see [Several hospitals](#several-hospitals-abdm-network)):
+
+| Hospital | Admin | Doctors | Reception | Lab | Health information staff |
+|---|---|---|---|---|---|
+| City General Hospital (CGH, Mumbai) | `admin` (`ADMIN_PASSWORD`) | `dr.mehta`, `dr.rao` | `reception` | `labtech` | `hims` |
+| Green Valley Multispeciality Hospital (GVH, Bengaluru) | `gvh.admin` | `gvh.shetty`, `gvh.kulkarni` | `gvh.reception` | `gvh.labtech` | `gvh.hims` |
+| Riverside Medical Centre (RMC, New Delhi) | `rmc.admin` | `rmc.malhotra`, `rmc.sheikh` | `rmc.reception` | `rmc.labtech` | `rmc.hims` |
+
+Each user sees only their own hospital's data. Two-step sign-in is off for the demo users unless
 `MFA_REQUIRED_ROLES` names their role; the app signs out after `SESSION_IDLE_MINUTES` (30) without activity.
+
+### Network administrator and hospital administrators
+
+There are two levels of administrator:
+
+| | Hospital administrator (`admin`, `gvh.admin`, `rmc.admin`) | Network administrator (`superadmin`) |
+|---|---|---|
+| Scope | One hospital | Every hospital |
+| Hospital profile, ABDM HIP/HIU IDs | Their own | Any hospital |
+| Staff accounts (add, role, password reset, deactivate, reset two-step sign-in) | Their own hospital's | Any hospital's |
+| Add a hospital (with its administrator), deactivate / activate a hospital | – | Yes |
+| Patients, clinical records, ABDM HIP/HIU work, audit log | Their own hospital's | **No** |
+
+The network administrator belongs to no hospital and cannot open patient or clinical data: each hospital's records
+stay with its own staff and move between hospitals only through ABDM with the patient's consent. Everything the
+network administrator changes is written to the audit log of the hospital concerned, so its administrator sees it.
+
+Create the account with `python scripts\create_network_admin.py` (default username `superadmin`; it asks for the
+name and password, which are never stored in `.env`). Signing in with it opens **Hospitals**: every hospital with
+its status, ABDM IDs, administrators and counts, **Add hospital**, and per hospital its staff accounts, profile and
+ABDM identity and *Deactivate hospital*. Deactivating signs all its staff out, blocks their sign-in and stops ABDM
+routing consent and record requests to it; its data is kept. To require two-step sign-in for it, add `network_admin`
+to `MFA_REQUIRED_ROLES`. A forgotten password: `python scripts\reset_password.py <username>` (works for any account).
 
 ## Configuration (`backend/.env`)
 
@@ -501,11 +533,55 @@ Demo logins (password `Demo@1234`): `dr.mehta`, `dr.rao` (doctors), `reception`,
 | `ABDM_VERIFY_CALLBACKS` | Verify gateway JWTs on callbacks (keep `true`) |
 | `ABDM_OTP_TEST_DISPLAY` | Sandbox testing only: show linking OTPs when no SMS gateway exists |
 | `HIU_AUTO_VALIDATE` | HL7-validate received bundles in the background |
-| `RECORD_SEALING_KEY`, `RECORD_SEALING_OLD_KEYS` | Key for records received from other providers (sealed at rest), separate from `JWT_SECRET`; earlier keys stay readable during a rotation. After setting or rotating it, run `python scriptseseal_records.py`. Unset = legacy key derived from `JWT_SECRET` |
+| `RECORD_SEALING_KEY`, `RECORD_SEALING_OLD_KEYS` | Key for records received from other providers (sealed at rest), separate from `JWT_SECRET`; earlier keys stay readable during a rotation. After setting or rotating it, run `python scripts
+eseal_records.py`. Unset = legacy key derived from `JWT_SECRET` |
 
 **ABDM sandbox**: register with NHA (sandbox.abdm.gov.in), register the facility as HIP and HIU services, set the
-`ABDM_*` values, set the hospital's HFR ID to `ABDM_HIP_ID`, expose the backend over https, then on *ABDM HIP →
+`ABDM_*` values, set the hospital's HFR ID to `ABDM_HIP_ID` (or, with several hospitals, set each hospital's ABDM HIP
+and HIU IDs on its *Hospital profile*), expose the backend over https, then on *ABDM HIP →
 Overview* use "Check gateway session" and "Register bridge URL".
+
+## Several hospitals (ABDM network)
+
+`python init_db.py --demo` creates three hospitals on one ABDM bridge (all synthetic, defined in `backend/app/demo.py`).
+Each has its own staff, doctors, lab catalogue and patients, and its own ABDM identity: a **HIP ID** (to share its
+records) and an **HIU ID** (to request other hospitals' records), shown on *ABDM HIP → Overview* and set on the
+*Hospital profile*. ABDM callbacks are routed to the hospital named in `X-HIP-ID` / `X-HIU-ID`.
+
+Every person has **one ABHA address, the same at every hospital** where they are registered, as in ABDM. The
+patient ID (`CGH-000004`, `GVH-000007`, ...) differs per hospital:
+
+| Person | ABHA address | Registered at |
+|---|---|---|
+| Surya Prakash | `surya@abdm` | CGH, GVH, RMC |
+| Ramesh Kumar | `ramesh.kumar@abdm` | CGH, GVH |
+| Sita Devi | `sita.devi@abdm` | CGH, RMC |
+| Meera Nair | `meera.nair@abdm` | GVH, RMC |
+| Arjun Singh / Farhan Ali / Lakshmi Iyer | `arjun.singh@abdm` / `farhan.ali@abdm` / `lakshmi.iyer@abdm` | CGH / GVH / RMC only |
+
+In simulation these addresses already exist in the simulated ABHA registry, so *Verify ABHA address with ABDM*
+works for them right away.
+
+`python scripts\seed_shared_records.py` (simulation mode, needs the HL7 validator) then has each hospital's own staff
+record visits through the API (consultation, approved prescription, approved lab report) for Surya at GVH and RMC,
+Ramesh at GVH and CGH and Sita at RMC. It validates the 15 FHIR documents (about 5 minutes), verifies every demo
+patient's ABHA address and links the validated records to it. It is safe to run again.
+
+**Seeing the exchange** (after both commands):
+
+1. Sign in at City General as `dr.mehta` → *External records (ABDM HIU)* → *New request* → patient Surya Prakash
+   (`surya@abdm`) → all record categories, from 2024 → *Send consent request to the patient*.
+2. *Simulate: patient grants*. The simulated consent manager finds the hospitals that linked records to
+   `surya@abdm` (Green Valley and Riverside), sends each the consent and the health information request, and each
+   encrypts and pushes its own records. The request shows one consent artefact per hospital, and *Retrieved records*
+   shows 6 records with their source hospital.
+3. Sign in as `gvh.hims` (or `rmc.hims`) → *ABDM HIP* → *Requests & consents* / *Transaction log*: the consent from
+   City General's HIU and the transfer *3 of 3 record(s) encrypted and sent to SIM_HIU_CGH*.
+4. It works in every direction, e.g. `gvh.kulkarni` requests Ramesh Kumar's records and receives City General's.
+   *Simulate: patient revokes* stops sharing at the HIPs too and erases the received copies.
+
+With a single hospital in the database the old behaviour remains: a simulated external provider (Sunrise Clinic)
+answers HIU requests. In sandbox mode, give each hospital the HIP and HIU IDs NHA registered for it.
 
 ## Workflows
 
@@ -593,7 +669,10 @@ HIU: `hiu_consent_requests, hiu_consent_artefacts, hiu_data_requests, retrieved_
 
 - **Simulated** (ABDM_MODE=simulation, labelled SIMULATION everywhere): the ABDM gateway and consent manager, the
   patient's ABHA app (ABHA accounts, discovery, OTP SMS, consent decisions), an external HIU receiving our data, and an
-  external HIP ("Sunrise Clinic (SIMULATED)") whose synthetic records we retrieve.
+  external HIP ("Sunrise Clinic (SIMULATED)") whose synthetic records we retrieve when only one hospital exists. With
+  several hospitals, the simulated consent manager routes consent and data requests between them; each hospital's
+  real HIP and HIU code does the rest (consent checks, encryption, push, decryption, storage). The simulated consent
+  manager keeps its state in memory: consent requests still waiting for a decision cannot be decided after a restart.
 - **ABDM sandbox**: implemented from NHA's Milestone 3 sandbox documentation (v2.5) and NHA's ABDM wrapper; verified
   only with contract tests against mocked HTTP. **Not yet exercised against the live sandbox** (no credentials).
 
@@ -606,7 +685,8 @@ HIU: `hiu_consent_requests, hiu_consent_artefacts, hiu_data_requests, retrieved_
 - Data-push checksum semantics are undocumented; MD5 of the FHIR content is used.
 - SQLite by default; simulator state is in memory.
 - Without `RECORD_SEALING_KEY`, stored external records are sealed with a key derived from `JWT_SECRET` (rotating it
-  would make them unreadable); set the sealing key and run `scriptseseal_records.py` to separate them.
+  would make them unreadable); set the sealing key and run `scripts
+eseal_records.py` to separate them.
 - HL7 validation takes about a minute per bundle; background validation is not durable across restarts.
 - Medicines have no drug codes (text only); ICD-10 codes need the terminology server for their official display.
 - AI features need `MISTRAL_API_KEY`; documents and questions are then sent to Mistral AI. They were tested with

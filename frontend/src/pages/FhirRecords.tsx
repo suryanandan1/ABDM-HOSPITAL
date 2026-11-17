@@ -2,12 +2,13 @@ import { useEffect, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import {
   Alert, Box, Button, Chip, FormControlLabel, LinearProgress, MenuItem, Paper, Skeleton, Stack, Switch, Tab, Table,
-  TableBody, TableCell, TableHead, TablePagination, TableRow, Tabs, TextField, Typography,
+  TableBody, TableCell, TableHead, TableRow, Tabs, TextField, Typography,
 } from '@mui/material'
 import DownloadIcon from '@mui/icons-material/Download'
 import { api, errorMessage, FhirRecord, formatDateTime, ValidationIssue } from '../api'
 import { useAuth } from '../auth'
 import { PatientBanner } from '../components/clinical'
+import { PagedTable, PatientCell } from '../components/ui'
 import { usePaged } from '../usePaged'
 
 const VALIDATION = {
@@ -32,7 +33,7 @@ function ValidationChip({ record }: { record: FhirRecord }) {
 export default function FhirRecords() {
   const navigate = useNavigate()
   const [status, setStatus] = useState('')
-  const { data, loading, error, pagination } = usePaged<FhirRecord>('/fhir/records', { validation_status: status })
+  const paged = usePaged<FhirRecord>('/fhir/records', { validation_status: status })
   return (
     <>
       <Typography variant="h5" mb={2}>FHIR records</Typography>
@@ -43,36 +44,15 @@ export default function FhirRecords() {
             {Object.entries(VALIDATION).map(([k, v]) => <MenuItem key={k} value={k}>{v.label}</MenuItem>)}
           </TextField>
         </Stack>
-        {loading && <LinearProgress />}
-        {error && <Alert severity="error">{error}</Alert>}
-        <Box sx={{ overflowX: 'auto' }}>
-          <Table size="small">
-            <TableHead>
-              <TableRow>
-                <TableCell>Generated</TableCell>
-                <TableCell>Patient</TableCell>
-                <TableCell>Record</TableCell>
-                <TableCell>Source</TableCell>
-                <TableCell>Validation</TableCell>
-                <TableCell>HIP</TableCell>
-              </TableRow>
-            </TableHead>
-            <TableBody>
-              {data.items.map((r) => (
-                <TableRow key={r.id} hover sx={{ cursor: 'pointer' }} onClick={() => navigate(`/fhir/records/${r.id}`)}>
-                  <TableCell sx={{ whiteSpace: 'nowrap' }}>{formatDateTime(r.generated_at)} · v{r.version}</TableCell>
-                  <TableCell>{r.patient.full_name}<br /><Typography variant="caption">{r.patient.patient_code}</Typography></TableCell>
-                  <TableCell>{r.record_type}<br /><Typography variant="caption">{r.title}</Typography></TableCell>
-                  <TableCell>{r.source_type.replace('_', ' ')} #{r.source_id}</TableCell>
-                  <TableCell><ValidationChip record={r} /></TableCell>
-                  <TableCell>{r.hip_eligible ? <Chip size="small" color="success" label="Eligible" /> : '—'}</TableCell>
-                </TableRow>
-              ))}
-              {!loading && data.items.length === 0 && <TableRow><TableCell colSpan={6}>No FHIR records yet. Approve a document or use “FHIR preview” on an approved record.</TableCell></TableRow>}
-            </TableBody>
-          </Table>
-        </Box>
-        <TablePagination component="div" rowsPerPageOptions={[10, 20, 50]} {...pagination} />
+        <PagedTable paged={paged} onRowClick={(r) => navigate(`/fhir/records/${r.id}`)}
+          empty="No FHIR records yet. Approve a document or use “FHIR preview” on an approved record." columns={[
+            ['Generated', (r) => `${formatDateTime(r.generated_at)} · v${r.version}`, { whiteSpace: 'nowrap' }],
+            ['Patient', (r) => <PatientCell patient={r.patient} />],
+            ['Record', (r) => <>{r.record_type}<br /><Typography variant="caption">{r.title}</Typography></>],
+            ['Source', (r) => `${r.source_type.replace('_', ' ')} #${r.source_id}`],
+            ['Validation', (r) => <ValidationChip record={r} />],
+            ['HIP', (r) => (r.hip_eligible ? <Chip size="small" color="success" label="Eligible" /> : '—')],
+          ]} />
       </Paper>
     </>
   )

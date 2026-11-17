@@ -30,9 +30,18 @@ def run_migrations_online() -> None:
             context.run_migrations()
         return
     with engine.connect() as connection:
+        if is_sqlite:  # table rebuilds need foreign key enforcement off (see init_db.migrate)
+            connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
+            connection.commit()
         context.configure(connection=connection, **options)
         with context.begin_transaction():
             context.run_migrations()
+        if is_sqlite:
+            broken = connection.exec_driver_sql("PRAGMA foreign_key_check").fetchall()
+            connection.exec_driver_sql("PRAGMA foreign_keys=ON")
+            connection.commit()
+            if broken:
+                raise RuntimeError(f"Migration left broken references: {broken[:5]}")
 
 
 if context.is_offline_mode():

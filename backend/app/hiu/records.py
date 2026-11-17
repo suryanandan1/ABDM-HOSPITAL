@@ -1,20 +1,12 @@
-"""Retrieved FHIR records: sealed storage, a read-only normalised view, timeline and lab trends.
-
-The original decrypted JSON is stored exactly as received (sealed at rest) and never modified; everything
-here is derived from it on demand.
-"""
-
 import base64
 import hashlib
 import json
 import os
 import re
 from datetime import datetime, timezone
-
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-
 from app.config import settings
 
 NRCES = "https://nrces.in/ndhm/fhir/r4/StructureDefinition/"
@@ -38,23 +30,18 @@ SEALED_V2 = "v2"
 def _derive(secret: str, salt: bytes, info: bytes) -> bytes:
     return HKDF(algorithm=hashes.SHA256(), length=32, salt=salt, info=info).derive(secret.encode())
 
-
 def _legacy_key() -> bytes:
     return _derive(settings.jwt_secret, b"abdm-hospital-hiu-storage", b"v1")
-
 
 def _sealing_key(secret: str) -> tuple[str, bytes]:
     key = _derive(secret, b"abdm-hospital-record-sealing", b"v2")
     return hashlib.sha256(key).hexdigest()[:12], key
 
-
 class SealingKeyMissing(RuntimeError):
     """A sealed value names a key that is not configured (neither RECORD_SEALING_KEY nor an old key)."""
 
-
 def active_key_id() -> str | None:
     return _sealing_key(settings.record_sealing_key)[0] if settings.record_sealing_key else None
-
 
 def seal(text: str) -> str:
     nonce = os.urandom(12)
@@ -63,7 +50,6 @@ def seal(text: str) -> str:
     key_id, key = _sealing_key(settings.record_sealing_key)
     body = base64.b64encode(nonce + AESGCM(key).encrypt(nonce, text.encode(), None)).decode()
     return f"{SEALED_V2}.{key_id}.{body}"
-
 
 def unseal(sealed: str) -> str:
     if sealed.startswith(SEALED_V2 + "."):

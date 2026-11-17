@@ -1,8 +1,8 @@
 import { useEffect, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import {
-  Alert, Box, Button, Checkbox, Dialog, DialogActions, DialogContent, DialogTitle, Divider, FormControlLabel,
-  Grid2 as Grid, IconButton, List, ListItemButton, ListItemText, MenuItem, Paper, Skeleton, Stack, TextField, Typography,
+  Alert, Box, Button, Checkbox, Divider, FormControlLabel, Grid2 as Grid, IconButton, List, ListItemButton,
+  ListItemText, MenuItem, Paper, Skeleton, Stack, TextField, Typography,
 } from '@mui/material'
 import DeleteIcon from '@mui/icons-material/Delete'
 import AddIcon from '@mui/icons-material/Add'
@@ -12,6 +12,8 @@ import {
 } from '../api'
 import { useAuth } from '../auth'
 import { FhirButton, PatientBanner, ReasonDialog, StatusChip } from '../components/clinical'
+import { useActions } from '../useActions'
+import { FormDialog } from '../components/ui'
 
 const TEXT_SECTIONS = [
   ['chief_complaint', 'Chief complaint'],
@@ -40,8 +42,6 @@ export default function ConsultationPage() {
   const [terms, setTerms] = useState<Terminology | null>(null)
   const [prescriptions, setPrescriptions] = useState<Prescription[]>([])
   const [orders, setOrders] = useState<LabOrder[]>([])
-  const [message, setMessage] = useState('')
-  const [error, setError] = useState('')
   const [dialog, setDialog] = useState<'cancel' | 'order' | null>(null)
 
   const load = (e: Encounter) => {
@@ -51,6 +51,7 @@ export default function ConsultationPage() {
     setFollowUpDate(e.follow_up_date ?? '')
     setDiagnoses(e.conditions)
   }
+  const { message, setMessage, error, setError, act: run } = useActions(load)
   const loadLinked = () => {
     api.get<Page<Prescription>>('/prescriptions', { params: { encounter_id: id, page_size: 50 } }).then((r) => setPrescriptions(r.data.items))
     if (can('lab:read')) api.get<Page<LabOrder>>('/lab/orders', { params: { encounter_id: id, page_size: 50 } }).then((r) => setOrders(r.data.items))
@@ -67,17 +68,6 @@ export default function ConsultationPage() {
   const isOwnDoctor = user?.doctor_id === encounter.doctor.id
   const editable = isOwnDoctor && encounter.status === 'draft'
   const active = encounter.status !== 'cancelled'
-
-  const run = async (request: () => Promise<{ data: Encounter }>, success: string) => {
-    try {
-      load((await request()).data)
-      setMessage(success)
-      setError('')
-    } catch (e) {
-      setError(errorMessage(e))
-      throw e
-    }
-  }
 
   const payload = () => ({
     ...text,
@@ -295,30 +285,24 @@ function OrderTestsDialog({ encounterId, onClose, onOrdered }: { encounterId: nu
   }
 
   return (
-    <Dialog open onClose={onClose} maxWidth="sm" fullWidth>
-      <DialogTitle>Order laboratory tests</DialogTitle>
-      <DialogContent>
-        {error && <Alert severity="error" sx={{ mb: 2 }}>{error}</Alert>}
-        <Stack>
-          {tests.map((t) => (
-            <FormControlLabel key={t.id} control={<Checkbox checked={selected.includes(t.id)} onChange={() => toggle(t.id)} />}
-              label={`${t.name} (${t.sample_type})`} />
-          ))}
-          {tests.length === 0 && <Typography color="text.secondary">The lab catalogue is empty.</Typography>}
-        </Stack>
-        <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2} mt={2}>
-          <TextField select label="Priority" value={priority} onChange={(e) => setPriority(e.target.value)} sx={{ width: { sm: 160 } }}>
-            <MenuItem value="routine">Routine</MenuItem>
-            <MenuItem value="urgent">Urgent</MenuItem>
-            <MenuItem value="stat">STAT</MenuItem>
-          </TextField>
-          <TextField label="Clinical notes for the lab" value={notes} onChange={(e) => setNotes(e.target.value)} />
-        </Stack>
-      </DialogContent>
-      <DialogActions>
-        <Button onClick={onClose}>Cancel</Button>
-        <Button variant="contained" disabled={selected.length === 0} onClick={submit}>Order {selected.length || ''} test{selected.length === 1 ? '' : 's'}</Button>
-      </DialogActions>
-    </Dialog>
+    <FormDialog title="Order laboratory tests" onClose={onClose}
+      actions={<Button variant="contained" disabled={selected.length === 0} onClick={submit}>Order {selected.length || ''} test{selected.length === 1 ? '' : 's'}</Button>}>
+      {error && <Alert severity="error" sx={{ mb: 2 }}>{error}</Alert>}
+      <Stack>
+        {tests.map((t) => (
+          <FormControlLabel key={t.id} control={<Checkbox checked={selected.includes(t.id)} onChange={() => toggle(t.id)} />}
+            label={`${t.name} (${t.sample_type})`} />
+        ))}
+        {tests.length === 0 && <Typography color="text.secondary">The lab catalogue is empty.</Typography>}
+      </Stack>
+      <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2} mt={2}>
+        <TextField select label="Priority" value={priority} onChange={(e) => setPriority(e.target.value)} sx={{ width: { sm: 160 } }}>
+          <MenuItem value="routine">Routine</MenuItem>
+          <MenuItem value="urgent">Urgent</MenuItem>
+          <MenuItem value="stat">STAT</MenuItem>
+        </TextField>
+        <TextField label="Clinical notes for the lab" value={notes} onChange={(e) => setNotes(e.target.value)} />
+      </Stack>
+    </FormDialog>
   )
 }

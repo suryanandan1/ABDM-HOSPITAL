@@ -8,7 +8,7 @@ from app.models import Condition, Encounter, LabOrder, Patient, Prescription, Us
 from app.schemas import (ConditionOut, ConditionStatusUpdate, EncounterCreate, EncounterOut, EncounterUpdate, Page,
                          PatientHistory, ReasonRequest)
 from app.security import get_current_user, require
-from app.services import audit, current_doctor, get_or_404, mark_approved, paginate, require_status
+from app.services import audit, commit, current_doctor, get_or_404, mark_approved, paginate, require_status
 
 router = APIRouter(tags=["consultations"])
 
@@ -83,9 +83,7 @@ def save_consultation(encounter_id: int, body: EncounterUpdate, request: Request
         encounter.conditions = [Condition(patient_id=encounter.patient_id, **d.model_dump()) for d in body.diagnoses]
     audit(db, user, "consultation.update", "consultation", encounter.id,
           {"fields": sorted(body.model_fields_set)}, request)
-    db.commit()
-    db.refresh(encounter)
-    return encounter
+    return commit(db, encounter)
 
 
 @router.post("/consultations/{encounter_id}/finalize", response_model=EncounterOut)

@@ -10,6 +10,7 @@ import PrintIcon from '@mui/icons-material/Print'
 import { api, Encounter, errorMessage, formatDate, formatDateTime, getTerminology, Prescription, PrescriptionItem, Terminology } from '../api'
 import { useAuth } from '../auth'
 import { FhirButton, PatientBanner, ReasonDialog, StatusChip } from '../components/clinical'
+import { useActions } from '../useActions'
 
 const EMPTY_ITEM: PrescriptionItem = {
   medicine_name: '', dosage: '', route: 'oral', frequency: 'BD', duration_days: 5, quantity: null, instructions: null,
@@ -28,8 +29,6 @@ export default function PrescriptionPage() {
   const [terms, setTerms] = useState<Terminology | null>(null)
   const [reviewed, setReviewed] = useState(false)
   const [dialog, setDialog] = useState<'reject' | 'cancel' | null>(null)
-  const [message, setMessage] = useState('')
-  const [error, setError] = useState('')
 
   const load = (p: Prescription) => {
     setPrescription(p)
@@ -37,6 +36,7 @@ export default function PrescriptionPage() {
     setNotes(p.notes ?? '')
     setReviewed(false)
   }
+  const { message, setMessage, error, setError, act } = useActions(load)
 
   useEffect(() => {
     getTerminology().then(setTerms)
@@ -56,16 +56,6 @@ export default function PrescriptionPage() {
   const routeLabel = (key: string) => terms.routes.find((r) => r.key === key)?.label ?? key
   const frequencyLabel = (key: string) => terms.frequencies.find((f) => f.key === key)?.label ?? key
 
-  const act = async (request: () => Promise<{ data: Prescription }>, success: string) => {
-    try {
-      load((await request()).data)
-      setMessage(success)
-      setError('')
-    } catch (e) {
-      setError(errorMessage(e))
-      throw e
-    }
-  }
   const body = () => ({
     items: items.map((i) => ({ ...i, quantity: i.quantity || null, instructions: i.instructions || null })),
     notes: notes || null,

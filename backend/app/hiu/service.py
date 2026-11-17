@@ -12,7 +12,7 @@ import threading
 import uuid
 from datetime import datetime, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app import fhir_validation
@@ -42,8 +42,9 @@ def push_url(token: str) -> str:
     return f"{settings.abdm_bridge_url or 'sim://hiu'}/api/hiu/data-push/{token}"
 
 
-def hiu_headers(request_id: str | None = None) -> dict:
-    return {"X-HIU-ID": gateway.hiu_id(), **({"REQUEST-ID": request_id} if request_id else {})}
+def hiu_headers(hospital: Hospital, request_id: str | None = None) -> dict:
+    """Headers of an HIU call made for one hospital (its own HIU ID)."""
+    return {"X-HIU-ID": gateway.hiu_id(hospital), **({"REQUEST-ID": request_id} if request_id else {})}
 
 
 # ---------- 1. consent request ----------
@@ -63,6 +64,7 @@ def create_request(db: Session, user: User, patient: Patient, doctor: Doctor, pu
         raise HiuError("The data erase date must be in the future")
     if not doctor.is_active or doctor.hospital_id != patient.hospital_id:
         raise HiuError("Choose an active doctor of this hospital as the requester")
+    hospital = db.get(Hospital, patient.hospital_id)
     request_id = str(uuid.uuid4())
     request = HiuConsentRequest(
         hospital_id=patient.hospital_id, patient_id=patient.id, requested_by_id=user.id, requester_doctor_id=doctor.id,
@@ -74,7 +76,7 @@ def create_request(db: Session, user: User, patient: Patient, doctor: Doctor, pu
     body = {"consent": {
         "purpose": {"text": PURPOSES[purpose], "code": purpose, "refUri": PURPOSE_REF_URI},
         "patient": {"id": patient.abha_address},
-        "hiu": {"id": gateway.hiu_id()},
+        "hiu": {"id": gateway.hiu_id(hospital)},
         "requester": {"name": doctor.full_name,
                       "identifier": {"type": "REGNO", "value": doctor.registration_number, "system": REQUESTER_SYSTEM}},
         "hiTypes": sorted(hi_types),
@@ -87,7 +89,7 @@ def create_request(db: Session, user: User, patient: Patient, doctor: Doctor, pu
     audit(db, user, "hiu.consent_request", "patient", patient.id, {"purpose": purpose, "hi_types": hi_types,
                                                                    "requester": doctor.full_name})
     db.commit()
-    status, data, _ = gateway.call(gateway.CONSENT_INIT_PATH, body, hiu_headers(request_id))
+    status, data, _ = gateway.call(gateway.CONSENT_INIT_PATH, body, hiu_headers(hospital, request_id))
     tx.http_status = status
     if 200 <= status < 300:
         tx.message = "Accepted by the consent manager; waiting for on-init"
@@ -101,6 +103,7 @@ def create_request(db: Session, user: User, patient: Patient, doctor: Doctor, pu
 
 def on_init(db: Session, hospital: Hospital, headers: dict, body: dict) -> str:
     request = db.scalar(select(HiuConsentRequest).where(
+        HiuConsentRequest.hospital_id == hospital.id,
         HiuConsentRequest.request_id == (body.get("response") or {}).get("requestId")))
     if request is None:
         return "Unknown consent request acknowledgement"
@@ -117,7 +120,7 @@ def check_status(db: Session, request: HiuConsentRequest) -> str:
     if not request.consent_request_id:
         raise HiuError("The consent manager has not acknowledged this request yet")
     status, data, request_id = gateway.call(gateway.CONSENT_STATUS_PATH, {"consentRequestId": request.consent_request_id},
-                                            hiu_headers())
+                                            hiu_headers(request.hospital))
     record(db, request.hospital_id, "hiu_consent_status", "outbound", "success" if 200 <= status < 300 else "failed",
            "Consent status requested" if 200 <= status < 300 else f"Status request refused (HTTP {status})",
            request_id=request_id, patient_id=request.patient_id, http_status=status)
@@ -127,7 +130,8 @@ def check_status(db: Session, request: HiuConsentRequest) -> str:
 
 def on_status(db: Session, hospital: Hospital, headers: dict, body: dict) -> str:
     info = body.get("consentRequest") or {}
-    request = db.scalar(select(HiuConsentRequest).where(HiuConsentRequest.consent_request_id == info.get("id")))
+    request = db.scalar(select(HiuConsentRequest).where(HiuConsentRequest.hospital_id == hospital.id,
+                                                        HiuConsentRequest.consent_request_id == info.get("id")))
     if request is None:
         return "Status for an unknown consent request"
     status = (info.get("status") or "").upper()
@@ -141,7 +145,8 @@ def on_status(db: Session, hospital: Hospital, headers: dict, body: dict) -> str
 def notify(db: Session, hospital: Hospital, headers: dict, body: dict) -> str:
     n = body.get("notification") or {}
     status, artefact_ids = (n.get("status") or "").upper(), [a.get("id") for a in n.get("consentArtefacts") or [] if a.get("id")]
-    request = db.scalar(select(HiuConsentRequest).where(HiuConsentRequest.consent_request_id == n.get("consentRequestId")))
+    request = db.scalar(select(HiuConsentRequest).where(HiuConsentRequest.hospital_id == hospital.id,
+                                                        HiuConsentRequest.consent_request_id == n.get("consentRequestId")))
     ack = {"acknowledgement": [{"status": "OK", "consentId": a} for a in artefact_ids],
            "response": {"requestId": headers.get("request-id")}}
     message = "Notification for an unknown consent request"
@@ -160,7 +165,7 @@ def notify(db: Session, hospital: Hospital, headers: dict, body: dict) -> str:
                     erase_records(db, artefact.artefact_id)  # data may not be used once consent ends
         message = request.status_message
     db.commit()
-    gateway.call(gateway.CONSENT_HIU_ON_NOTIFY_PATH, ack, hiu_headers())
+    gateway.call(gateway.CONSENT_HIU_ON_NOTIFY_PATH, ack, hiu_headers(hospital))
     if request is not None and status == "GRANTED":
         for artefact in request.artefacts:
             if artefact.status == "notified":
@@ -172,7 +177,8 @@ def fetch_artefact(db: Session, artefact: HiuConsentArtefact) -> None:
     request_id = str(uuid.uuid4())
     artefact.fetch_request_id, artefact.status_message = request_id, "Fetching the artefact"
     db.commit()
-    status, _, _ = gateway.call(gateway.CONSENT_FETCH_PATH, {"consentId": artefact.artefact_id}, hiu_headers(request_id))
+    status, _, _ = gateway.call(gateway.CONSENT_FETCH_PATH, {"consentId": artefact.artefact_id},
+                                hiu_headers(artefact.consent_request.hospital, request_id))
     record(db, artefact.consent_request.hospital_id, "hiu_consent_fetch", "outbound",
            "pending" if 200 <= status < 300 else "failed",
            "Artefact requested" if 200 <= status < 300 else f"Artefact fetch refused (HTTP {status}); retry from the request",
@@ -182,13 +188,13 @@ def fetch_artefact(db: Session, artefact: HiuConsentArtefact) -> None:
 
 
 def artefact_problem(request: HiuConsentRequest, artefact_id: str, status: str, detail: dict) -> str | None:
-    """The artefact must be granted and exactly within what this hospital asked for."""
+    """The artefact must be granted to this hospital's HIU and exactly within what it asked for."""
     permission = detail.get("permission") or {}
     if status != "GRANTED":
         return f"Artefact status is {status or 'missing'}"
     if detail.get("consentId") != artefact_id:
         return "Artefact id does not match"
-    if (detail.get("hiu") or {}).get("id") != gateway.hiu_id():
+    if (detail.get("hiu") or {}).get("id") != gateway.hiu_id(request.hospital):
         return "Artefact is for a different HIU"
     if ((detail.get("patient") or {}).get("id") or "").lower() != request.abha_address.lower():
         return "Artefact is for a different patient"
@@ -219,7 +225,7 @@ def artefact_problem(request: HiuConsentRequest, artefact_id: str, status: str, 
 def on_fetch(db: Session, hospital: Hospital, headers: dict, body: dict) -> str:
     artefact = db.scalar(select(HiuConsentArtefact).where(
         HiuConsentArtefact.fetch_request_id == (body.get("response") or {}).get("requestId")))
-    if artefact is None:
+    if artefact is None or artefact.consent_request.hospital_id != hospital.id:
         return "Artefact for an unknown fetch"
     consent, request = body.get("consent") or {}, artefact.consent_request
     if body.get("error"):
@@ -239,7 +245,9 @@ def on_fetch(db: Session, hospital: Hospital, headers: dict, body: dict) -> str:
     artefact.date_from = parse_time(permission["dateRange"]["from"])
     artefact.date_to = parse_time(permission["dateRange"]["to"])
     artefact.data_erase_at = parse_time(permission["dataEraseAt"])
-    artefact.status_message = f"Valid consent from {artefact.hip_id} for {', '.join(artefact.hi_types)}"
+    source = db.scalar(select(Hospital.name).where(Hospital.abdm_hip_id == artefact.hip_id))
+    artefact.status_message = (f"Valid consent from {source + ' (' + artefact.hip_id + ')' if source else artefact.hip_id} "
+                               f"for {', '.join(artefact.hi_types)}")
     db.commit()
     request_data(db, artefact)  # permitted automation: a valid artefact is exactly what the patient approved
     return artefact.status_message
@@ -274,7 +282,7 @@ def request_data(db: Session, artefact: HiuConsentArtefact) -> HiuDataRequest:
     tx = record(db, request.hospital_id, "hiu_data_request", "outbound", "pending", "Health information requested",
                 request_id=request_id, consent_id=artefact.artefact_id, patient_id=request.patient_id)
     db.commit()
-    status, data, _ = gateway.call(gateway.HI_REQUEST_PATH, body, hiu_headers(request_id))
+    status, data, _ = gateway.call(gateway.HI_REQUEST_PATH, body, hiu_headers(request.hospital, request_id))
     tx.http_status = status
     if not 200 <= status < 300:
         data_request.status = tx.status = "failed"
@@ -288,7 +296,7 @@ def request_data(db: Session, artefact: HiuConsentArtefact) -> HiuDataRequest:
 def on_request(db: Session, hospital: Hospital, headers: dict, body: dict) -> str:
     data_request = db.scalar(select(HiuDataRequest).where(
         HiuDataRequest.request_id == (body.get("response") or {}).get("requestId")))
-    if data_request is None:
+    if data_request is None or data_request.artefact.consent_request.hospital_id != hospital.id:
         return "Acknowledgement for an unknown data request"
     if body.get("error") or not (body.get("hiRequest") or {}).get("transactionId"):
         data_request.status, data_request.key_material = "failed", None
@@ -352,7 +360,18 @@ def receive_push(db: Session, token: str, body: dict) -> tuple[int, str, list[in
     if done:
         data_request.status, data_request.key_material = "received", None  # key destroyed: no reuse of the push URL
         data_request.status_message = f"{received} record(s) received and stored"
-        request.status, request.status_message = "received", data_request.status_message
+        db.flush()
+        # A consent can cover several providers (one artefact each): the request is complete when all have sent.
+        waiting = db.scalar(select(func.count()).select_from(HiuDataRequest).join(HiuConsentArtefact).where(
+            HiuConsentArtefact.consent_request_id == request.id, HiuDataRequest.status.in_(("requested", "acknowledged"))))
+        artefact_ids = [a.artefact_id for a in request.artefacts]
+        total, providers = db.execute(select(func.count(), func.count(RetrievedRecord.source_hip_id.distinct())).where(
+            RetrievedRecord.consent_artefact_id.in_(artefact_ids))).one()
+        summary = f"{total} record(s) received from {providers} provider(s)" if providers > 1 else data_request.status_message
+        if waiting:
+            request.status_message = f"{summary} so far; waiting for {waiting} more provider(s)"
+        else:
+            request.status, request.status_message = "received", summary
     record(db, request.hospital_id, "hiu_data_push", "inbound", "success" if received else "failed",
            f"Page {data_request.pages_received}/{data_request.pages_expected}: {received} of {len(statuses)} record(s) accepted",
            transaction_id=data_request.transaction_id, consent_id=artefact.artefact_id, patient_id=request.patient_id,
@@ -362,10 +381,10 @@ def receive_push(db: Session, token: str, body: dict) -> tuple[int, str, list[in
     db.commit()
     notification = {"notification": {
         "consentId": artefact.artefact_id, "transactionId": data_request.transaction_id, "doneAt": gateway.timestamp(),
-        "notifier": {"type": "HIU", "id": gateway.hiu_id()},
+        "notifier": {"type": "HIU", "id": gateway.hiu_id(request.hospital)},
         "statusNotification": {"sessionStatus": "TRANSFERRED" if received else "FAILED", "hipId": artefact.hip_id,
                                "statusResponses": statuses}}}
-    gateway.call(gateway.HI_NOTIFY_PATH, notification, hiu_headers())
+    gateway.call(gateway.HI_NOTIFY_PATH, notification, hiu_headers(request.hospital))
     ids = [r.id for r in stored]
     if ids and settings.hiu_auto_validate and fhir_validation.validator_available():
         threading.Thread(target=lambda: [validate_record(i) for i in ids], daemon=True).start()
@@ -416,8 +435,10 @@ INBOUND = {"hiu_on_init": on_init, "hiu_on_status": on_status, "hiu_notify": not
 def handle_inbound(kind: str, headers: dict, body: dict):
     headers = {k.lower(): v for k, v in headers.items()}
     with SessionLocal() as db:
-        from app.hip.service import hip_hospital
-        hospital = hip_hospital(db)
+        from app.hip.service import hospital_for
+        hospital = hospital_for(db, headers.get("x-hiu-id"), "hiu")
+        if hospital is None:
+            raise HiuError(f"No hospital uses HIU ID {headers.get('x-hiu-id')}")
         try:
             message = INBOUND[kind](db, hospital, headers, body)
             status = "failed" if body.get("error") else "success"

@@ -27,6 +27,8 @@ const FhirRecordPage = lazy(() => import('./pages/FhirRecords').then((m) => ({ d
 const Hip = lazy(() => import('./pages/Hip'))
 const Hiu = lazy(() => import('./pages/Hiu'))
 const Assistant = lazy(() => import('./pages/Assistant'))
+const Network = lazy(() => import('./pages/Network'))
+const NetworkHospitalPage = lazy(() => import('./pages/Network').then((m) => ({ default: m.NetworkHospitalPage })))
 
 function Guard({ permission, children }: { permission: string; children: ReactNode }) {
   const { can } = useAuth()
@@ -35,7 +37,7 @@ function Guard({ permission, children }: { permission: string; children: ReactNo
 }
 
 export default function App() {
-  const { user } = useAuth()
+  const { user, can } = useAuth()
   if (!user) {
     return (
       <Routes>
@@ -47,7 +49,10 @@ export default function App() {
   return (
     <Routes>
       <Route element={<Layout />}>
-        <Route index element={<Guard permission="dashboard:view"><Dashboard /></Guard>} />
+        <Route index element={can('dashboard:view') || !can('network:manage')
+          ? <Guard permission="dashboard:view"><Dashboard /></Guard> : <Navigate to="/network" replace />} />
+        <Route path="network" element={<Guard permission="network:manage"><Network /></Guard>} />
+        <Route path="network/hospitals/:id" element={<Guard permission="network:manage"><NetworkHospitalPage /></Guard>} />
         <Route path="patients" element={<Guard permission="patient:read"><Patients /></Guard>} />
         <Route path="patients/new" element={<Guard permission="patient:create"><PatientRegister /></Guard>} />
         <Route path="patients/:id" element={<Guard permission="patient:read"><PatientDetail /></Guard>} />

@@ -1,9 +1,6 @@
 import { ReactNode, useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import {
-  Alert, Box, Grid2 as Grid, List, ListItem, ListItemText, Paper, Skeleton, Table, TableBody, TableCell,
-  TableHead, TableRow, Typography,
-} from '@mui/material'
+import { Alert, Box, Grid2 as Grid, List, ListItem, ListItemText, Paper, Skeleton, Typography } from '@mui/material'
 import PeopleIcon from '@mui/icons-material/People'
 import TodayIcon from '@mui/icons-material/Today'
 import VerifiedIcon from '@mui/icons-material/Verified'
@@ -13,6 +10,7 @@ import AssignmentIcon from '@mui/icons-material/Assignment'
 import ScienceIcon from '@mui/icons-material/Science'
 import FactCheckIcon from '@mui/icons-material/FactCheck'
 import { api, ageOf, Dashboard as DashboardData, errorMessage, formatDateTime, GENDERS } from '../api'
+import { DataTable } from '../components/ui'
 import { useAuth } from '../auth'
 import AbhaStatus from '../components/AbhaStatus'
 
@@ -68,31 +66,12 @@ export default function Dashboard() {
           <Grid size={{ xs: 12, lg: can('audit:read') ? 7 : 12 }}>
             <Paper sx={{ p: 2 }}>
               <Typography variant="h6" mb={1}>Recent patients</Typography>
-              <Box sx={{ overflowX: 'auto' }}>
-                <Table size="small">
-                  <TableHead>
-                    <TableRow>
-                      <TableCell>Patient ID</TableCell>
-                      <TableCell>Name</TableCell>
-                      <TableCell>Age / Gender</TableCell>
-                      <TableCell>ABHA</TableCell>
-                    </TableRow>
-                  </TableHead>
-                  <TableBody>
-                    {data.recent_patients.map((p) => (
-                      <TableRow key={p.id} hover sx={{ cursor: 'pointer' }} onClick={() => navigate(`/patients/${p.id}`)}>
-                        <TableCell>{p.patient_code}</TableCell>
-                        <TableCell>{p.full_name}</TableCell>
-                        <TableCell>{ageOf(p)} / {GENDERS[p.gender]}</TableCell>
-                        <TableCell><AbhaStatus patient={p} /></TableCell>
-                      </TableRow>
-                    ))}
-                    {data.recent_patients.length === 0 && (
-                      <TableRow><TableCell colSpan={4}>No patients registered yet.</TableCell></TableRow>
-                    )}
-                  </TableBody>
-                </Table>
-              </Box>
+              <DataTable rows={data.recent_patients} empty="No patients registered yet." onRowClick={(p) => navigate(`/patients/${p.id}`)} columns={[
+                ['Patient ID', (p) => p.patient_code],
+                ['Name', (p) => p.full_name],
+                ['Age / Gender', (p) => <>{ageOf(p)} / {GENDERS[p.gender]}</>],
+                ['ABHA', (p) => <AbhaStatus patient={p} />],
+              ]} />
             </Paper>
           </Grid>
         )}

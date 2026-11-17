@@ -6,7 +6,7 @@ from app.database import get_db
 from app.models import Encounter, Prescription, PrescriptionItem, User
 from app.schemas import Page, PrescriptionCreate, PrescriptionIn, PrescriptionOut, ReasonRequest
 from app.security import require
-from app.services import audit, current_doctor, get_or_404, mark_approved, paginate, require_status
+from app.services import audit, commit, current_doctor, get_or_404, mark_approved, paginate, require_status
 
 router = APIRouter(prefix="/prescriptions", tags=["prescriptions"])
 
@@ -71,9 +71,7 @@ def update_prescription(prescription_id: int, body: PrescriptionIn, request: Req
     prescription.status = "draft"
     audit(db, user, "prescription.update", "prescription", prescription.id,
           {"medicines": len(body.items)}, request)
-    db.commit()
-    db.refresh(prescription)
-    return prescription
+    return commit(db, prescription)
 
 
 @router.post("/{prescription_id}/submit", response_model=PrescriptionOut)

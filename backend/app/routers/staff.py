@@ -1,3 +1,5 @@
+from typing import get_args
+
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
@@ -7,7 +9,7 @@ from app.database import get_db
 from app.models import Role, User
 from app.schemas import Page, RoleOut, RoleCode, StaffCreate, StaffUpdate, UserOut
 from app.security import ROLES, hash_password, require, revoke_tokens
-from app.services import audit, changed_fields, get_or_404, paginate
+from app.services import audit, changed_fields, commit, get_or_404, paginate
 
 router = APIRouter(tags=["staff"])
 
@@ -16,18 +18,15 @@ def role_by_code(db: Session, code: str) -> Role:
     return db.scalar(select(Role).where(Role.code == code))
 
 
-@router.get("/roles", response_model=list[RoleOut])
-def list_roles(_: User = Depends(require("staff:read")), db: Session = Depends(get_db)):
+def hospital_roles(db: Session) -> list[RoleOut]:
+    """The roles a hospital's staff can have (not the network administrator)."""
     return [RoleOut(code=r.code, name=r.name, description=r.description,
                     permissions=sorted(ROLES[r.code]["permissions"]))
-            for r in db.scalars(select(Role).order_by(Role.id))]
+            for r in db.scalars(select(Role).where(Role.code.in_(get_args(RoleCode))).order_by(Role.id))]
 
 
-@router.get("/staff", response_model=Page[UserOut])
-def list_staff(q: str | None = None, role: RoleCode | None = None, is_active: bool | None = None,
-               page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100),
-               user: User = Depends(require("staff:read")), db: Session = Depends(get_db)):
-    query = select(User).where(User.hospital_id == user.hospital_id).order_by(User.full_name)
+def staff_query(hospital_id: int, q: str | None, role: str | None, is_active: bool | None):
+    query = select(User).where(User.hospital_id == hospital_id).order_by(User.full_name)
     if q:
         like = f"%{q.strip()}%"
         query = query.where(or_(User.full_name.ilike(like), User.username.ilike(like), User.email.ilike(like)))
@@ -35,39 +34,29 @@ def list_staff(q: str | None = None, role: RoleCode | None = None, is_active: bo
         query = query.join(Role).where(Role.code == role)
     if is_active is not None:
         query = query.where(User.is_active == is_active)
-    return paginate(db, query, page, page_size)
+    return query
 
 
-@router.get("/staff/{user_id}", response_model=UserOut)
-def get_staff(user_id: int, user: User = Depends(require("staff:read")), db: Session = Depends(get_db)):
-    return get_or_404(db, User, user_id, user.hospital_id)
-
-
-@router.post("/staff", response_model=UserOut, status_code=201)
-def create_staff(body: StaffCreate, request: Request,
-                 user: User = Depends(require("staff:manage")), db: Session = Depends(get_db)):
+def create_staff_account(db: Session, hospital_id: int, body: StaffCreate, actor: User, request: Request) -> User:
+    """Add a staff account to a hospital (by its administrator or a network administrator)."""
     username = body.username.lower()
     if db.scalar(select(User.id).where(User.username == username)):
         raise HTTPException(409, "Username is already taken")
-    staff = User(hospital_id=user.hospital_id, role_id=role_by_code(db, body.role).id, username=username,
+    staff = User(hospital_id=hospital_id, role_id=role_by_code(db, body.role).id, username=username,
                  password_hash=hash_password(body.password), full_name=body.full_name,
                  email=body.email, phone=body.phone)
     db.add(staff)
     db.flush()
-    audit(db, user, "staff.create", "user", staff.id, {"username": username, "role": body.role}, request)
-    db.commit()
-    db.refresh(staff)
-    return staff
+    audit(db, actor, "staff.create", "user", staff.id, {"username": username, "role": body.role}, request,
+          hospital_id=hospital_id)
+    return commit(db, staff)
 
 
-@router.patch("/staff/{user_id}", response_model=UserOut)
-def update_staff(user_id: int, body: StaffUpdate, request: Request,
-                 user: User = Depends(require("staff:manage")), db: Session = Depends(get_db)):
-    staff = get_or_404(db, User, user_id, user.hospital_id)
+def update_staff_account(db: Session, staff: User, body: StaffUpdate, actor: User, request: Request) -> User:
     data = body.model_dump(exclude_unset=True)
     if data.get("full_name", "") is None:
         raise HTTPException(422, "Full name is required")
-    if staff.id == user.id and (("role" in data and data["role"] != staff.role_code) or data.get("is_active") is False):
+    if staff.id == actor.id and (("role" in data and data["role"] != staff.role_code) or data.get("is_active") is False):
         raise HTTPException(400, "You cannot change your own role or deactivate your own account")
 
     changes = {}
@@ -83,20 +72,52 @@ def update_staff(user_id: int, body: StaffUpdate, request: Request,
     if "password" in changes or "role" in changes or data.get("is_active") is False:
         revoke_tokens(staff)  # existing sessions must not keep the old password, permissions or access
     if changes:
-        audit(db, user, "staff.update", "user", staff.id, {"changes": changes}, request)
+        audit(db, actor, "staff.update", "user", staff.id, {"changes": changes}, request, hospital_id=staff.hospital_id)
         db.commit()
     return staff
+
+
+def reset_staff_two_step(db: Session, staff: User, actor: User, request: Request) -> User:
+    if not staff.mfa_enabled and not staff.mfa_secret:
+        raise HTTPException(400, "Two-step sign-in is not set up for this account")
+    mfa.clear(staff)
+    revoke_tokens(staff)
+    audit(db, actor, "staff.mfa_reset", "user", staff.id, request=request, hospital_id=staff.hospital_id)
+    db.commit()
+    return staff
+
+
+@router.get("/roles", response_model=list[RoleOut])
+def list_roles(_: User = Depends(require("staff:read")), db: Session = Depends(get_db)):
+    return hospital_roles(db)
+
+
+@router.get("/staff", response_model=Page[UserOut])
+def list_staff(q: str | None = None, role: RoleCode | None = None, is_active: bool | None = None,
+               page: int = Query(1, ge=1), page_size: int = Query(20, ge=1, le=100),
+               user: User = Depends(require("staff:read")), db: Session = Depends(get_db)):
+    return paginate(db, staff_query(user.hospital_id, q, role, is_active), page, page_size)
+
+
+@router.get("/staff/{user_id}", response_model=UserOut)
+def get_staff(user_id: int, user: User = Depends(require("staff:read")), db: Session = Depends(get_db)):
+    return get_or_404(db, User, user_id, user.hospital_id)
+
+
+@router.post("/staff", response_model=UserOut, status_code=201)
+def create_staff(body: StaffCreate, request: Request,
+                 user: User = Depends(require("staff:manage")), db: Session = Depends(get_db)):
+    return create_staff_account(db, user.hospital_id, body, user, request)
+
+
+@router.patch("/staff/{user_id}", response_model=UserOut)
+def update_staff(user_id: int, body: StaffUpdate, request: Request,
+                 user: User = Depends(require("staff:manage")), db: Session = Depends(get_db)):
+    return update_staff_account(db, get_or_404(db, User, user_id, user.hospital_id), body, user, request)
 
 
 @router.delete("/staff/{user_id}/mfa", response_model=UserOut)
 def reset_staff_mfa(user_id: int, request: Request,
                     user: User = Depends(require("staff:manage")), db: Session = Depends(get_db)):
     """Turn off a staff member's two-step sign-in (lost phone); they set it up again at their next sign-in."""
-    staff = get_or_404(db, User, user_id, user.hospital_id)
-    if not staff.mfa_enabled and not staff.mfa_secret:
-        raise HTTPException(400, "Two-step sign-in is not set up for this account")
-    mfa.clear(staff)
-    revoke_tokens(staff)
-    audit(db, user, "staff.mfa_reset", "user", staff.id, request=request)
-    db.commit()
-    return staff
+    return reset_staff_two_step(db, get_or_404(db, User, user_id, user.hospital_id), user, request)

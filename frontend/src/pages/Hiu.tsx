@@ -1,13 +1,14 @@
 import { useEffect, useState } from 'react'
 import {
   Alert, Box, Button, Checkbox, Chip, Dialog, DialogActions, DialogContent, DialogTitle, FormControlLabel, FormGroup,
-  Grid2 as Grid, LinearProgress, MenuItem, Paper, Stack, Tab, Table, TableBody, TableCell, TableHead, TablePagination,
+  Grid2 as Grid, LinearProgress, MenuItem, Paper, Stack, Tab, Table, TableBody, TableCell, TablePagination,
   TableRow, Tabs, TextField, Typography,
 } from '@mui/material'
 import AutoAwesomeIcon from '@mui/icons-material/AutoAwesome'
 import { api, Doctor, errorMessage, formatDate, formatDateTime, Page, PatientSummary } from '../api'
 import { useAuth } from '../auth'
 import { PatientBanner, PatientPicker } from '../components/clinical'
+import { DataTable, StatTiles } from '../components/ui'
 import { usePaged } from '../usePaged'
 import { ModeChip } from './Hip'
 
@@ -45,10 +46,12 @@ export default function Hiu() {
       <Stack direction="row" spacing={1} alignItems="center" mb={2}>
         <Typography variant="h5">External records (ABDM HIU)</Typography>
         {dash && <ModeChip mode={dash.mode} />}
+        {dash?.hiu_id && <Chip size="small" variant="outlined" label={`HIU ${dash.hiu_id} · ${dash.hospital}`} />}
       </Stack>
       {dash?.mode === 'simulation' && (
-        <Alert severity="info" sx={{ mb: 2 }}>Simulation: consent decisions and records come from a simulated consent manager and a
-          simulated provider (Sunrise Clinic). They are synthetic and are not ABDM retrievals.</Alert>
+        <Alert severity="info" sx={{ mb: 2 }}>Simulation: the consent manager and the patient's decision are simulated. Records come
+          from the other hospitals on this bridge that have linked records to the patient's ABHA address (or, with a single hospital,
+          from a simulated provider, Sunrise Clinic). They are not ABDM retrievals.</Alert>
       )}
       <Paper>
         <Tabs value={tab} onChange={(_, v) => setTab(v)} variant="scrollable" sx={{ px: 1, borderBottom: '1px solid #e3e7ed' }}>
@@ -77,35 +80,17 @@ function Dashboard({ dash, onOpen }: { dash: any; onOpen: (id: number) => void }
     ['Failed / ended', c.failed], ['Stored records', c.records]] as const
   return (
     <Stack spacing={2}>
-      <Grid container spacing={1.5}>
-        {tiles.map(([label, value]) => (
-          <Grid key={label} size={{ xs: 6, md: 3 }}>
-            <Paper variant="outlined" sx={{ p: 1.5 }}><Typography variant="h6">{value ?? 0}</Typography>
-              <Typography variant="body2" color="text.secondary">{label}</Typography></Paper>
-          </Grid>
-        ))}
-      </Grid>
+      <StatTiles tiles={tiles} />
       <Typography variant="subtitle1" fontWeight={600}>Request history</Typography>
       {loading && <LinearProgress />}
-      <Box sx={{ overflowX: 'auto' }}>
-        <Table size="small">
-          <TableHead><TableRow><TableCell>Created</TableCell><TableCell>Patient</TableCell><TableCell>Records requested</TableCell>
-            <TableCell>Purpose</TableCell><TableCell>Status</TableCell><TableCell>What is happening</TableCell></TableRow></TableHead>
-          <TableBody>
-            {data.items.map((r) => (
-              <TableRow key={r.id} hover sx={{ cursor: 'pointer' }} onClick={() => onOpen(r.id)}>
-                <TableCell sx={{ whiteSpace: 'nowrap' }}>{formatDateTime(r.created_at)}</TableCell>
-                <TableCell>{r.patient.full_name}<Typography variant="caption" display="block">{r.abha_address}</Typography></TableCell>
-                <TableCell>{r.hi_types.map((t) => HI_LABEL[t]).join(', ')}</TableCell>
-                <TableCell>{dash.purposes[r.purpose_code]}</TableCell>
-                <TableCell><StatusChip status={r.status} /> <ModeChip mode={r.mode} /></TableCell>
-                <TableCell sx={{ maxWidth: 360 }}>{r.status_message}</TableCell>
-              </TableRow>
-            ))}
-            {!loading && data.items.length === 0 && <TableRow><TableCell colSpan={6}>No requests yet.</TableCell></TableRow>}
-          </TableBody>
-        </Table>
-      </Box>
+      <DataTable rows={data.items} empty={loading ? undefined : 'No requests yet.'} onRowClick={(r) => onOpen(r.id)} columns={[
+        ['Created', (r) => formatDateTime(r.created_at), { whiteSpace: 'nowrap' }],
+        ['Patient', (r) => <>{r.patient.full_name}<Typography variant="caption" display="block">{r.abha_address}</Typography></>],
+        ['Records requested', (r) => r.hi_types.map((t) => HI_LABEL[t]).join(', ')],
+        ['Purpose', (r) => dash.purposes[r.purpose_code]],
+        ['Status', (r) => <><StatusChip status={r.status} /> <ModeChip mode={r.mode} /></>],
+        ['What is happening', (r) => r.status_message, { maxWidth: 360 }],
+      ]} />
       <TablePagination component="div" rowsPerPageOptions={[10, 20, 50]} {...pagination} />
     </Stack>
   )
@@ -227,7 +212,7 @@ function RequestDetail({ id, simulation, onChange }: { id: number; simulation: b
       <Paper variant="outlined" sx={{ p: 2 }}>
         <Stack direction="row" spacing={1} alignItems="center" mb={1}><StatusChip status={r.status} /><ModeChip mode={r.mode} />
           <Typography>{r.status_message}</Typography></Stack>
-        <Typography variant="body2">Requested by {detail.requester} · {r.hi_types.map((t) => HI_LABEL[t]).join(', ')} ·
+        <Typography variant="body2">ABHA address <b>{r.abha_address}</b> · requested by {detail.requester} · {r.hi_types.map((t) => HI_LABEL[t]).join(', ')} ·
           {' '}{formatDate(r.date_from)} – {formatDate(r.date_to)} · data deleted {formatDate(r.data_erase_at)}</Typography>
         {r.reason && <Typography variant="body2">Reason: {r.reason}</Typography>}
         <Stack direction="row" spacing={1} mt={1}>
@@ -250,7 +235,7 @@ function RequestDetail({ id, simulation, onChange }: { id: number; simulation: b
         {detail.artefacts.length === 0 && <Typography color="text.secondary">None yet. Nothing can be retrieved until the patient grants consent.</Typography>}
         {detail.artefacts.map((a: any) => (
           <Stack key={a.id} direction={{ xs: 'column', md: 'row' }} spacing={1} alignItems={{ md: 'center' }} mb={1}>
-            <StatusChip status={a.status} /><Typography variant="body2">{a.hip_id ?? 'provider'} · {(a.hi_types ?? []).map((t: string) => HI_LABEL[t]).join(', ')} · {a.care_contexts} record(s) · {a.status_message}</Typography>
+            <StatusChip status={a.status} /><Typography variant="body2"><b>{a.hip_name ?? a.hip_id ?? 'provider'}</b>{a.hip_name && ` (${a.hip_id})`} · {(a.hi_types ?? []).map((t: string) => HI_LABEL[t]).join(', ')} · {a.care_contexts} record(s) · {a.status_message}</Typography>
             {manage && ['notified', 'invalid'].includes(a.status) && <Button size="small" onClick={() => act(() => api.post(`/hiu/artefacts/${a.id}/fetch`), 'Fetch requested')}>Fetch again</Button>}
             {manage && a.status === 'valid' && !detail.data_requests.some((d: any) => ['requested', 'acknowledged'].includes(d.status)) && (
               <Button size="small" onClick={() => act(() => api.post(`/hiu/artefacts/${a.id}/request-data`), 'Data requested again')}>Request data again</Button>
@@ -299,28 +284,17 @@ function RetrievedRecords() {
       {view && (
         <>
           <PatientBanner patient={view.patient} />
-          <Typography variant="body2" color="text.secondary">Records received from other providers under the patient's consent. Originals are kept unmodified and deleted on the consent's erase date. Every view is logged.</Typography>
-          <Box sx={{ overflowX: 'auto' }}>
-            <Table size="small">
-              <TableHead><TableRow><TableCell>#</TableCell><TableCell>Source</TableCell><TableCell>Category</TableCell><TableCell>Record date</TableCell>
-                <TableCell>Retrieved</TableCell><TableCell>Consent</TableCell><TableCell>Validation</TableCell><TableCell>Deleted on</TableCell></TableRow></TableHead>
-              <TableBody>
-                {view.records.map((r: any) => (
-                  <TableRow key={r.id} hover sx={{ cursor: 'pointer' }} onClick={() => open(r.id)}>
-                    <TableCell>{r.id}</TableCell>
-                    <TableCell>{r.source_name ?? r.source_hip_id} <ModeChip mode={r.mode} /></TableCell>
-                    <TableCell>{r.category}</TableCell>
-                    <TableCell>{formatDate(r.record_date)}</TableCell>
-                    <TableCell>{formatDateTime(r.received_at)}</TableCell>
-                    <TableCell>{r.consent_artefact_id.slice(0, 8)}…</TableCell>
-                    <TableCell><StatusChip status={r.validation_status} />{!r.checksum_ok && <Chip size="small" label="checksum differs" color="warning" />}</TableCell>
-                    <TableCell>{formatDate(r.erase_at)}</TableCell>
-                  </TableRow>
-                ))}
-                {view.records.length === 0 && <TableRow><TableCell colSpan={8}>No retrieved records.</TableCell></TableRow>}
-              </TableBody>
-            </Table>
-          </Box>
+          <Typography variant="body2" color="text.secondary">Records received from other providers for <b>{view.patient.abha_address}</b> under the patient's consent. Originals are kept unmodified and deleted on the consent's erase date. Every view is logged.</Typography>
+          <DataTable rows={view.records as any[]} empty="No retrieved records." onRowClick={(r) => open(r.id)} columns={[
+            ['#', (r) => r.id],
+            ['Source (HIP)', (r) => <>{r.source_name ?? r.source_hip_id} <ModeChip mode={r.mode} /><Typography variant="caption" display="block">{r.source_hip_id} · {r.care_context_reference}</Typography></>],
+            ['Category', (r) => r.category],
+            ['Record date', (r) => formatDate(r.record_date)],
+            ['Retrieved', (r) => formatDateTime(r.received_at)],
+            ['Consent', (r) => `${r.consent_artefact_id.slice(0, 8)}…`],
+            ['Validation', (r) => <><StatusChip status={r.validation_status} />{!r.checksum_ok && <Chip size="small" label="checksum differs" color="warning" />}</>],
+            ['Deleted on', (r) => formatDate(r.erase_at)],
+          ]} />
 
           {view.records.length > 0 && (
             <Grid container spacing={2}>

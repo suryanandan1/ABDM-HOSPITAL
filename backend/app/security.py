@@ -35,13 +35,18 @@ ALL_PERMISSIONS = {
     "hip:read", "hip:manage", "hip:configure",
     # Phase 5: ABDM HIU (records = viewing clinical content received from other providers).
     "hiu:read", "hiu:request", "hiu:records",
+    # Network administration: every hospital's profile, ABDM IDs, activation and staff accounts. Only the
+    # network_admin role has it, and that role has nothing else (no patient or clinical data).
+    "network:manage",
 }
+HOSPITAL_PERMISSIONS = ALL_PERMISSIONS - {"network:manage"}
+NETWORK_ADMIN = "network_admin"
 
 ROLES: dict[str, dict] = {
     "hospital_admin": {
         "name": "Hospital Administrator",
         "description": "Manages hospital profile, staff, doctors and has full access.",
-        "permissions": ALL_PERMISSIONS,
+        "permissions": HOSPITAL_PERMISSIONS,
     },
     "doctor": {
         "name": "Doctor",
@@ -73,7 +78,22 @@ ROLES: dict[str, dict] = {
                         "document:read", "document:write", "terminology:confirm", "fhir:read", "fhir:generate",
                         "hip:read", "hip:manage", "hiu:read", "hiu:request"},
     },
+    NETWORK_ADMIN: {
+        "name": "Network Administrator",
+        "description": "Manages every hospital on the network (profiles, ABDM IDs, activation) and their staff "
+                       "accounts. Belongs to no hospital and cannot see patient or clinical data.",
+        "permissions": {"network:manage"},
+    },
 }
+
+
+def can_sign_in(user: User) -> bool:
+    """Active account, and an active hospital (network administrators have none)."""
+    if not user.is_active:
+        return False
+    if user.hospital is None:
+        return user.role.code == NETWORK_ADMIN
+    return user.hospital.is_active
 
 
 def permissions_for(user: User) -> set[str]:
@@ -211,7 +231,7 @@ def get_session_user(
         version, session_id = int(payload["ver"]), str(payload["sid"])
     except (jwt.PyJWTError, KeyError, ValueError, TypeError):
         raise unauthorized
-    if user is None or not user.is_active or not user.hospital.is_active or version != user.token_version:
+    if user is None or not can_sign_in(user) or version != user.token_version:
         raise unauthorized
     session = db.get(UserSession, session_id)
     now = utcnow()

@@ -119,14 +119,14 @@ class UserOut(ORMModel):
     is_active: bool
     role_code: str
     role_name: str
-    hospital_id: int
+    hospital_id: int | None  # None: network administrator
     mfa_enabled: bool = False  # two-step sign-in is on
     last_login_at: UTCDateTime | None
     created_at: UTCDateTime
 
 
 class CurrentUser(UserOut):
-    hospital_name: str
+    hospital_name: str | None
     permissions: list[str]
     doctor_id: int | None = None  # linked doctor profile, needed for clinical authoring/approval
     mfa_setup_required: bool = False  # the role requires two-step sign-in and it is not set up yet
@@ -183,6 +183,8 @@ class RoleOut(ORMModel):
 class HospitalUpdate(BaseModel):
     name: Name | None = None
     hfr_id: OptStr = None
+    abdm_hip_id: OptStr = None  # facility ID registered as this hospital's HIP service
+    abdm_hiu_id: OptStr = None  # facility ID registered as this hospital's HIU service
     facility_type: OptStr = None
     address: OptStr = None
     city: OptStr = None
@@ -197,6 +199,8 @@ class HospitalOut(ORMModel):
     name: str
     code: str
     hfr_id: str | None
+    abdm_hip_id: str | None
+    abdm_hiu_id: str | None
     facility_type: str | None
     address: str | None
     city: str | None
@@ -205,6 +209,45 @@ class HospitalOut(ORMModel):
     phone: str | None
     email: str | None
     created_at: UTCDateTime
+
+
+# ---------- network administration (every hospital) ----------
+
+class NetworkHospitalUpdate(HospitalUpdate):
+    is_active: bool | None = None  # off: none of the hospital's staff can sign in; ABDM no longer routes to it
+
+
+class FirstAdmin(BaseModel):
+    username: Annotated[str, Field(pattern=r"^[a-zA-Z0-9._-]{3,50}$")]
+    full_name: Name
+    password: Password
+
+
+class NetworkHospitalCreate(HospitalUpdate):
+    name: Name
+    code: Annotated[str, Field(pattern=r"^[A-Za-z0-9]{2,10}$")]  # patient ID prefix, fixed once created
+    admin: FirstAdmin | None = None  # the hospital's own administrator account
+
+
+class HospitalStats(BaseModel):
+    staff: int
+    active_staff: int
+    doctors: int
+    patients: int
+    shared_records: int  # care contexts linked to patients' ABHA addresses (shareable through ABDM)
+
+
+class StaffBrief(ORMModel):
+    id: int
+    username: str
+    full_name: str
+    is_active: bool
+
+
+class NetworkHospitalOut(HospitalOut):
+    is_active: bool
+    stats: HospitalStats
+    admins: list[StaffBrief]
 
 
 # ---------- doctors ----------

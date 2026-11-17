@@ -1,17 +1,15 @@
 import { useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import {
-  Alert, Box, LinearProgress, MenuItem, Paper, Stack, Table, TableBody, TableCell, TableHead, TablePagination,
-  TableRow, TextField, Typography,
-} from '@mui/material'
+import { MenuItem, Paper, Stack, TextField, Typography } from '@mui/material'
 import { formatDate, Prescription } from '../api'
 import { StatusChip } from '../components/clinical'
+import { PagedTable, PatientCell } from '../components/ui'
 import { usePaged } from '../usePaged'
 
 export default function Prescriptions() {
   const navigate = useNavigate()
   const [status, setStatus] = useState('')
-  const { data, loading, error, pagination } = usePaged<Prescription>('/prescriptions', { status })
+  const paged = usePaged<Prescription>('/prescriptions', { status })
 
   return (
     <>
@@ -25,36 +23,14 @@ export default function Prescriptions() {
             ))}
           </TextField>
         </Stack>
-        {loading && <LinearProgress />}
-        {error && <Alert severity="error">{error}</Alert>}
-        <Box sx={{ overflowX: 'auto' }}>
-          <Table size="small">
-            <TableHead>
-              <TableRow>
-                <TableCell>#</TableCell>
-                <TableCell>Date</TableCell>
-                <TableCell>Patient</TableCell>
-                <TableCell>Doctor</TableCell>
-                <TableCell>Medicines</TableCell>
-                <TableCell>Status</TableCell>
-              </TableRow>
-            </TableHead>
-            <TableBody>
-              {data.items.map((p) => (
-                <TableRow key={p.id} hover sx={{ cursor: 'pointer' }} onClick={() => navigate(`/prescriptions/${p.id}`)}>
-                  <TableCell>{p.id}</TableCell>
-                  <TableCell>{formatDate(p.prescription_date)}</TableCell>
-                  <TableCell>{p.patient.full_name}<br /><Typography variant="caption">{p.patient.patient_code}</Typography></TableCell>
-                  <TableCell>{p.doctor.full_name}</TableCell>
-                  <TableCell>{p.items.map((i) => i.medicine_name).join(', ')}</TableCell>
-                  <TableCell><StatusChip status={p.status} /></TableCell>
-                </TableRow>
-              ))}
-              {!loading && data.items.length === 0 && <TableRow><TableCell colSpan={6}>No prescriptions found.</TableCell></TableRow>}
-            </TableBody>
-          </Table>
-        </Box>
-        <TablePagination component="div" rowsPerPageOptions={[10, 20, 50]} {...pagination} />
+        <PagedTable paged={paged} empty="No prescriptions found." onRowClick={(p) => navigate(`/prescriptions/${p.id}`)} columns={[
+          ['#', (p) => p.id],
+          ['Date', (p) => formatDate(p.prescription_date)],
+          ['Patient', (p) => <PatientCell patient={p.patient} />],
+          ['Doctor', (p) => p.doctor.full_name],
+          ['Medicines', (p) => p.items.map((i) => i.medicine_name).join(', ')],
+          ['Status', (p) => <StatusChip status={p.status} />],
+        ]} />
       </Paper>
     </>
   )

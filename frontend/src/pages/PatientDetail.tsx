@@ -1,8 +1,8 @@
 import { ReactNode, useEffect, useState } from 'react'
 import { useLocation, useNavigate, useParams } from 'react-router-dom'
 import {
-  Alert, Box, Button, Dialog, DialogActions, DialogContent, DialogTitle, Grid2 as Grid, List, ListItem,
-  ListItemText, MenuItem, Paper, Skeleton, Stack, TextField, Typography,
+  Alert, Box, Button, Dialog, DialogContent, DialogTitle, Grid2 as Grid, List, ListItem, ListItemText, MenuItem, Paper,
+  Skeleton, Stack, TextField, Typography,
 } from '@mui/material'
 import EditIcon from '@mui/icons-material/Edit'
 import ArrowBackIcon from '@mui/icons-material/ArrowBack'
@@ -12,6 +12,7 @@ import AbhaStatus from '../components/AbhaStatus'
 import PatientForm, { PatientPayload } from '../components/PatientForm'
 import { startConsultation } from './Consultations'
 import { Briefing } from './Assistant'
+import { FormDialog } from '../components/ui'
 
 const VERIFY_METHODS = {
   physical_abha_card: 'Physical ABHA card checked',
@@ -183,27 +184,22 @@ function VerifyDialog({ busy, onClose, onSubmit }: { busy: boolean; onClose: () 
   const [method, setMethod] = useState('physical_abha_card')
   const [note, setNote] = useState('')
   return (
-    <Dialog open onClose={onClose} maxWidth="sm" fullWidth>
-      <DialogTitle>Record ABHA verification</DialogTitle>
-      <DialogContent>
-        <Stack spacing={2} pt={1}>
-          <Alert severity="info">
-            Only record verification after confirming the ABHA number/address belongs to this patient.
-            Verification through ABDM services will be added in a later phase.
-          </Alert>
-          <TextField select label="How was it verified?" value={method} onChange={(e) => setMethod(e.target.value)}>
-            {Object.entries(VERIFY_METHODS).map(([k, v]) => <MenuItem key={k} value={k}>{v}</MenuItem>)}
-          </TextField>
-          <TextField label="Note (what was checked)" multiline minRows={2} value={note} onChange={(e) => setNote(e.target.value)}
-            helperText="At least 5 characters" />
-        </Stack>
-      </DialogContent>
-      <DialogActions>
-        <Button onClick={onClose}>Cancel</Button>
-        <Button variant="contained" disabled={busy || note.trim().length < 5} onClick={() => onSubmit({ method, note: note.trim() })}>
-          Mark as verified
-        </Button>
-      </DialogActions>
-    </Dialog>
+    <FormDialog title="Record ABHA verification" onClose={onClose} actions={
+      <Button variant="contained" disabled={busy || note.trim().length < 5} onClick={() => onSubmit({ method, note: note.trim() })}>
+        Mark as verified
+      </Button>
+    }>
+      <Stack spacing={2} pt={1}>
+        <Alert severity="info">
+          Only record verification after confirming the ABHA number/address belongs to this patient.
+          Verification through ABDM services will be added in a later phase.
+        </Alert>
+        <TextField select label="How was it verified?" value={method} onChange={(e) => setMethod(e.target.value)}>
+          {Object.entries(VERIFY_METHODS).map(([k, v]) => <MenuItem key={k} value={k}>{v}</MenuItem>)}
+        </TextField>
+        <TextField label="Note (what was checked)" multiline minRows={2} value={note} onChange={(e) => setNote(e.target.value)}
+          helperText="At least 5 characters" />
+      </Stack>
+    </FormDialog>
   )
 }

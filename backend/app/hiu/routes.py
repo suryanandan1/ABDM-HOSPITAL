@@ -12,7 +12,7 @@ from app.ai import AIError
 from app.config import settings
 from app.database import get_db
 from app.hip import gateway
-from app.hip.routes import accept, after_change, utc
+from app.hip.routes import accept, after_change, facility_names, utc
 from app.hiu import ai as hiu_ai, records, service, simulator
 from app.models import (Doctor, Encounter, HipTransaction, HiuConsentArtefact, HiuConsentRequest, HiuDataRequest,
                         HiuPatientSummary, Patient, Prescription, RetrievedRecord, User, utcnow)
@@ -81,7 +81,7 @@ def dashboard(user: User = Depends(require("hiu:read")), db: Session = Depends(g
     counts = {status: n for status, n in rows}
     today = datetime.combine(date.today(), time.min)
     return {
-        "mode": settings.abdm_mode, "hiu_id": gateway.hiu_id(),
+        "mode": settings.abdm_mode, "hiu_id": gateway.hiu_id(user.hospital), "hospital": user.hospital.name,
         "counts": {"new_today": db.scalar(select(func.count()).select_from(HiuConsentRequest).where(
                        HiuConsentRequest.hospital_id == user.hospital_id, HiuConsentRequest.created_at >= today)),
                    "pending_consent": counts.get("pending_consent", 0) + counts.get("requested", 0),
@@ -166,6 +166,7 @@ def list_requests(status: str | None = None, patient_id: int | None = None, page
 @staff.get("/requests/{request_id}")
 def get_request(request_id: int, user: User = Depends(require("hiu:read")), db: Session = Depends(get_db)):
     request = get_or_404(db, HiuConsentRequest, request_id, user.hospital_id)
+    hip_names = facility_names(db, "hip")
     artefact_ids = [a.artefact_id for a in request.artefacts]
     data_requests = db.scalars(select(HiuDataRequest).where(
         HiuDataRequest.artefact_id.in_([a.id for a in request.artefacts])).order_by(HiuDataRequest.id)).all()
@@ -178,7 +179,7 @@ def get_request(request_id: int, user: User = Depends(require("hiu:read")), db: 
         "request": RequestOut.model_validate(request).model_dump(),
         "requester": request.requester_doctor.full_name, "ai_suggestion": request.ai_suggestion,
         "artefacts": [{"id": a.id, "artefact_id": a.artefact_id, "status": a.status, "status_message": a.status_message,
-                       "hip_id": a.hip_id, "hi_types": a.hi_types, "care_contexts": len(a.care_contexts or []),
+                       "hip_id": a.hip_id, "hip_name": hip_names.get(a.hip_id), "hi_types": a.hi_types, "care_contexts": len(a.care_contexts or []),
                        "date_from": utc(a.date_from), "date_to": utc(a.date_to), "data_erase_at": utc(a.data_erase_at)}
                       for a in request.artefacts],
         "data_requests": [{"id": d.id, "artefact_id": d.artefact.artefact_id, "status": d.status,
@@ -315,7 +316,10 @@ def simulate_revoke(request_id: int, user: User = Depends(require("hiu:request")
     if not gateway.simulation():
         raise HTTPException(409, "Simulation actions are disabled in sandbox mode")
     request = get_or_404(db, HiuConsentRequest, request_id, user.hospital_id)
-    simulator.revoke(request.consent_request_id)
+    try:
+        simulator.revoke(request.consent_request_id)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc))
     db.refresh(request)
     return RequestOut.model_validate(request).model_dump()
 
@@ -341,5 +345,5 @@ HIU_REQUIRED = {"hiu_on_init": ["response.requestId"], "hiu_on_status": ["respon
 for kind, path in {"hiu_on_init": "/v3/hiu/consent/request/on-init", "hiu_on_status": "/v3/hiu/consent/request/on-status",
                    "hiu_notify": "/v3/hiu/consent/request/notify", "hiu_on_fetch": "/v3/hiu/consent/on-fetch",
                    "hiu_on_request": "/v3/hiu/health-information/on-request"}.items():
-    callbacks.add_api_route(path, accept(kind, HIU_REQUIRED[kind], service.handle_inbound, "x-hiu-id", gateway.hiu_id),
+    callbacks.add_api_route(path, accept(kind, HIU_REQUIRED[kind], service.handle_inbound, "hiu"),
                             methods=["POST"], status_code=202, name=f"abdm_{kind}")

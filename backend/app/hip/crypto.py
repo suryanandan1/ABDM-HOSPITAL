@@ -91,11 +91,6 @@ def u_from_public_key(key: bytes) -> int:
     return (x - SHIFT) % P
 
 
-def java_bigint_bytes(value: int) -> bytes:
-    """Java BigInteger.toByteArray() for a positive value (big-endian, sign bit kept clear)."""
-    return value.to_bytes(value.bit_length() // 8 + 1, "big")
-
-
 def generate_key_material() -> dict:
     """Ephemeral HIP key pair and nonce for one data transfer (never stored or logged)."""
     private = secrets.randbelow(N - 1) + 1

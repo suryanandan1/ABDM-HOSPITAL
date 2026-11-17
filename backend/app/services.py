@@ -31,6 +31,13 @@ def paginate(db: Session, query, page: int, page_size: int) -> dict:
     return {"items": items, "total": total, "page": page, "page_size": page_size}
 
 
+def commit(db: Session, obj):
+    """Commit the transaction and return `obj` reloaded from the database."""
+    db.commit()
+    db.refresh(obj)
+    return obj
+
+
 def get_or_404(db: Session, model, entity_id: int, hospital_id: int):
     """Fetch a row that belongs to the caller's hospital, or raise 404."""
     obj = db.get(model, entity_id)

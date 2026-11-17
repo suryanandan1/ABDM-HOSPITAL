@@ -13,6 +13,7 @@ import { useAuth } from '../auth'
 import { PatientBanner, PatientPicker, ReasonDialog, StatusChip } from '../components/clinical'
 import { FieldGroupEditor, FieldListEditor, ReviewFieldInput } from '../components/ReviewFields'
 import { EXTRACTION_CHIP } from './Documents'
+import { useActions } from '../useActions'
 
 const LISTS = {
   diagnoses: { title: 'Diagnoses (as documented)', keys: ['text', 'icd10_code'], add: 'Add diagnosis' },
@@ -31,6 +32,12 @@ const FOCUS: Record<DocumentType, string[]> = {
   immunization: ['immunizations'], wellness: ['vitals'], clinical_note: ['summary', 'encounter'], other: ['summary'],
 }
 
+/** The approval requirements the API lists when a document is not ready, otherwise the plain error message. */
+const describeError = (e: any) => {
+  const needs = e?.response?.data?.detail?.requirements as string[] | undefined
+  return needs ? <>Not ready for approval:<ul>{needs.map((n) => <li key={n}>{n}</li>)}</ul></> : errorMessage(e)
+}
+
 export default function DocumentReview() {
   const { id } = useParams()
   const { can, user } = useAuth()
@@ -40,8 +47,6 @@ export default function DocumentReview() {
   const [dirty, setDirty] = useState(false)
   const [doctors, setDoctors] = useState<Doctor[]>([])
   const [fileUrl, setFileUrl] = useState('')
-  const [message, setMessage] = useState('')
-  const [error, setError] = useState<ReactNode>('')
   const [dialog, setDialog] = useState<'reject' | 'cancel' | null>(null)
 
   const load = (d: ClinicalDocument) => {
@@ -49,6 +54,7 @@ export default function DocumentReview() {
     setRecord(d.data)
     setDirty(false)
   }
+  const { message, setMessage, error, setError, act: run } = useActions(load, describeError)
 
   useEffect(() => {
     api.get<ClinicalDocument>(`/documents/${id}`).then((r) => load(r.data)).catch((e) => setError(errorMessage(e)))
@@ -68,17 +74,6 @@ export default function DocumentReview() {
   if (!doc) return error ? <Alert severity="error">{error}</Alert> : <Skeleton variant="rounded" height={400} />
 
   const editable = can('document:write') && ['draft', 'rejected'].includes(doc.status) && doc.extraction_status !== 'pending'
-  const run = async (request: () => Promise<{ data: ClinicalDocument }>, success: string) => {
-    try {
-      load((await request()).data)
-      setMessage(success)
-      setError('')
-    } catch (e: any) {
-      const needs = e?.response?.data?.detail?.requirements as string[] | undefined
-      setError(needs ? <>Not ready for approval:<ul>{needs.map((n) => <li key={n}>{n}</li>)}</ul></> : errorMessage(e))
-      throw e
-    }
-  }
   const save = (changes: Record<string, unknown> = {}) =>
     run(() => api.put(`/documents/${id}`, { ...(dirty ? { data: record } : {}), ...changes }), 'Saved.')
   const quiet = (p: Promise<unknown>) => p.catch(() => undefined)

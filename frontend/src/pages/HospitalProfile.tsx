@@ -3,13 +3,14 @@ import { Alert, Button, Grid2 as Grid, Paper, Skeleton, Stack, TextField, Typogr
 import { api, errorMessage, Hospital } from '../api'
 import { useAuth } from '../auth'
 
-const FIELDS = [
+export const FIELDS = [
   ['name', 'Hospital name', 12], ['hfr_id', 'HFR ID (ABDM Health Facility Registry)', 6],
+  ['abdm_hip_id', 'ABDM HIP ID (facility registered as HIP)', 6], ['abdm_hiu_id', 'ABDM HIU ID (facility registered as HIU)', 6],
   ['facility_type', 'Facility type', 6], ['address', 'Address', 12], ['city', 'City', 4], ['state', 'State', 4],
   ['pincode', 'Pincode', 4], ['phone', 'Phone', 6], ['email', 'Email', 6],
 ] as const
 
-type Field = (typeof FIELDS)[number][0]
+export type Field = (typeof FIELDS)[number][0]
 
 export default function HospitalProfile() {
   const { can } = useAuth()

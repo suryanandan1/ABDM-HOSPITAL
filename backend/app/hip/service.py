@@ -69,14 +69,34 @@ def parse_time(value: str | None) -> datetime | None:
     return parsed.astimezone(timezone.utc).replace(tzinfo=None) if parsed.tzinfo else parsed
 
 
-def hip_hospital(db: Session) -> Hospital:
-    """The hospital this HIP ID belongs to: matched by HFR ID, or the only hospital."""
-    hospital = db.scalar(select(Hospital).where(Hospital.hfr_id == gateway.hip_id()))
+def hospital_for(db: Session, facility_id: str | None, role: str = "hip") -> Hospital | None:
+    """The hospital an ABDM message is addressed to (X-HIP-ID or X-HIU-ID), or None when no hospital uses the ID.
+
+    A hospital with its own ID (Hospital.abdm_hip_id / abdm_hiu_id) answers only to that ID. The bridge-wide
+    default (ABDM_HIP_ID / ABDM_HIU_ID, or the simulation default) belongs to the hospital without its own ID
+    whose HFR ID equals it, else to the only hospital without its own ID."""
+    column = Hospital.abdm_hip_id if role == "hip" else Hospital.abdm_hiu_id
+    if facility_id:
+        hospital = db.scalar(select(Hospital).where(column == facility_id))
+        if hospital is not None:
+            return hospital if hospital.is_active else None  # a deactivated hospital takes no ABDM traffic
+    default = gateway.hip_id() if role == "hip" else gateway.hiu_id()
+    if facility_id and facility_id != default:
+        return None
+    unassigned = db.scalars(select(Hospital).where(column.is_(None), Hospital.is_active.is_(True))
+                            .order_by(Hospital.id)).all()
+    by_hfr = [h for h in unassigned if default and h.hfr_id == default]
+    if len(by_hfr) == 1:
+        return by_hfr[0]
+    return unassigned[0] if len(unassigned) == 1 else None
+
+
+def hip_hospital(db: Session, facility_id: str | None = None) -> Hospital:
+    """The hospital addressed by an X-HIP-ID (default: the bridge-wide HIP ID)."""
+    hospital = hospital_for(db, facility_id, "hip")
     if hospital is None:
-        hospitals = db.scalars(select(Hospital)).all()
-        if len(hospitals) != 1:
-            raise HipError("Set the hospital's HFR ID to ABDM_HIP_ID so callbacks can be routed")
-        hospital = hospitals[0]
+        raise HipError(f"No hospital uses HIP ID {facility_id or gateway.hip_id()}: set each hospital's ABDM HIP ID "
+                       "(Hospital profile) so callbacks can be routed")
     return hospital
 
 
@@ -138,6 +158,7 @@ def request_link_token(db: Session, user: User, patient: Patient) -> HipTransact
         raise HipError("Enter the patient's ABHA address first")
     if patient.gender not in ("M", "F", "O"):
         raise HipError("ABDM linking needs gender M, F or O")
+    hospital = db.get(Hospital, patient.hospital_id)
     body = {"abhaAddress": patient.abha_address, "name": patient.full_name, "gender": patient.gender,
             "yearOfBirth": patient.year_of_birth}
     request_id = str(uuid.uuid4())
@@ -151,7 +172,7 @@ def request_link_token(db: Session, user: User, patient: Patient) -> HipTransact
     audit(db, user, "hip.link_token_request", "patient", patient.id)
     db.commit()
     status, data, _ = gateway.call(gateway.GENERATE_LINK_TOKEN_PATH, body,
-                                   {"REQUEST-ID": request_id, "X-HIP-ID": gateway.hip_id()})
+                                   {"REQUEST-ID": request_id, "X-HIP-ID": gateway.hip_id(hospital)})
     if not check_accepted(db, tx, status, data, "Accepted by ABDM; waiting for the link token callback"):
         link.status, link.message = "failed", tx.message
     db.commit()
@@ -191,6 +212,7 @@ def link_care_contexts(db: Session, user: User, patient: Patient, contexts: list
         raise HipError("Verify the patient's ABHA address with ABDM (link token) first")
     if not contexts:
         raise HipError("No care contexts to link")
+    hospital = db.get(Hospital, patient.hospital_id)
     claims = jwt.decode(link.link_token, options={"verify_signature": False})
     body = {"abhaNumber": claims.get("abhaNumber"), "abhaAddress": link.abha_address, "patient": grouped(patient, contexts)}
     request_id = str(uuid.uuid4())
@@ -201,7 +223,7 @@ def link_care_contexts(db: Session, user: User, patient: Patient, contexts: list
     audit(db, user, "hip.care_context_link", "patient", patient.id, {"care_contexts": [c.reference for c in contexts]})
     db.commit()
     status, data, _ = gateway.call(gateway.ADD_CARE_CONTEXTS_PATH, body,
-                                   {"REQUEST-ID": request_id, "X-HIP-ID": gateway.hip_id(), "X-LINK-TOKEN": link.link_token})
+                                   {"REQUEST-ID": request_id, "X-HIP-ID": gateway.hip_id(hospital), "X-LINK-TOKEN": link.link_token})
     if not check_accepted(db, tx, status, data, "Accepted by ABDM; waiting for confirmation"):
         for c in contexts:
             c.link_status, c.message = "failed", tx.message
@@ -271,7 +293,7 @@ def discover(db: Session, hospital: Hospital, headers: dict, body: dict) -> HipT
                 request_id=headers.get("request-id"), patient_id=patient.id if patient else None,
                 details={"matchedBy": matched_by, "careContexts": [c.reference for c in contexts]})
     db.commit()
-    status, data, _ = gateway.call(gateway.ON_DISCOVER_PATH, response, {"X-HIP-ID": gateway.hip_id()})
+    status, data, _ = gateway.call(gateway.ON_DISCOVER_PATH, response, {"X-HIP-ID": gateway.hip_id(hospital)})
     if check_accepted(db, tx, status, data, message):
         tx.status = "success"  # a "no match" answer is still a completed discovery
     return tx
@@ -283,7 +305,8 @@ def link_init(db: Session, hospital: Hospital, headers: dict, body: dict) -> Hip
     patient_code = groups[0].get("referenceNumber") if groups else None
     refs = [c.get("referenceNumber") for g in groups for c in g.get("careContexts") or []]
     patient = db.scalar(select(Patient).where(Patient.hospital_id == hospital.id, Patient.patient_code == patient_code))
-    contexts = db.scalars(select(CareContext).where(CareContext.reference.in_(refs))).all() if patient else []
+    contexts = db.scalars(select(CareContext).where(CareContext.hospital_id == hospital.id,
+                                                    CareContext.reference.in_(refs))).all() if patient else []
     response = {"transactionId": transaction_id, "response": {"requestId": headers.get("request-id")}}
     problem = None
     if patient is None:
@@ -316,7 +339,7 @@ def link_init(db: Session, hospital: Hospital, headers: dict, body: dict) -> Hip
                     f"OTP sent to the patient's registered mobile {masked(patient.mobile)}",
                     transaction_id=transaction_id, patient_id=patient.id, details={"careContexts": refs})
     db.commit()
-    status, data, _ = gateway.call(gateway.ON_INIT_LINK_PATH, response, {"X-HIP-ID": gateway.hip_id()})
+    status, data, _ = gateway.call(gateway.ON_INIT_LINK_PATH, response, {"X-HIP-ID": gateway.hip_id(hospital)})
     if check_accepted(db, tx, status, data, tx.message) and not problem:
         tx.status = "success"
     return tx
@@ -324,7 +347,8 @@ def link_init(db: Session, hospital: Hospital, headers: dict, body: dict) -> Hip
 
 def link_confirm(db: Session, hospital: Hospital, headers: dict, body: dict) -> HipTransaction:
     confirmation = body.get("confirmation") or {}
-    request = db.scalar(select(HipLinkRequest).where(HipLinkRequest.link_reference == confirmation.get("linkRefNumber")))
+    request = db.scalar(select(HipLinkRequest).where(HipLinkRequest.hospital_id == hospital.id,
+                                                     HipLinkRequest.link_reference == confirmation.get("linkRefNumber")))
     response = {"response": {"requestId": headers.get("request-id")}}
     problem = None
     if request is None or request.status != "otp_sent":
@@ -340,7 +364,8 @@ def link_confirm(db: Session, hospital: Hospital, headers: dict, body: dict) -> 
                     patient_id=request.patient_id if request else None)
     else:
         patient = db.get(Patient, request.patient_id)
-        contexts = db.scalars(select(CareContext).where(CareContext.reference.in_(request.care_context_refs))).all()
+        contexts = db.scalars(select(CareContext).where(CareContext.hospital_id == hospital.id,
+                                                        CareContext.reference.in_(request.care_context_refs))).all()
         for c in contexts:
             c.link_status, c.linked_abha_address, c.linked_at = "linked", request.abha_address, utcnow()
             c.link_method, c.message = "patient_initiated", "Linked by the patient from their ABHA app"
@@ -355,7 +380,7 @@ def link_confirm(db: Session, hospital: Hospital, headers: dict, body: dict) -> 
                     f"{len(contexts)} care context(s) linked to {request.abha_address}", patient_id=patient.id,
                     details={"careContexts": request.care_context_refs})
     db.commit()
-    status, data, _ = gateway.call(gateway.ON_CONFIRM_LINK_PATH, response, {"X-HIP-ID": gateway.hip_id()})
+    status, data, _ = gateway.call(gateway.ON_CONFIRM_LINK_PATH, response, {"X-HIP-ID": gateway.hip_id(hospital)})
     if check_accepted(db, tx, status, data, tx.message) and not problem:
         tx.status = "success"
     return tx
@@ -365,11 +390,12 @@ def link_confirm(db: Session, hospital: Hospital, headers: dict, body: dict) -> 
 
 def consent_problem(db: Session, hospital: Hospital, detail: dict) -> tuple[str | None, Patient | None]:
     """Checks a GRANTED consent artefact against this HIP's records. Returns (problem, patient)."""
-    if (detail.get("hip") or {}).get("id") != gateway.hip_id():
+    if (detail.get("hip") or {}).get("id") != gateway.hip_id(hospital):
         return "Consent is for a different HIP", None
     address = ((detail.get("patient") or {}).get("id") or "").lower()
     refs = detail.get("careContexts") or []
     contexts = db.scalars(select(CareContext).where(
+        CareContext.hospital_id == hospital.id,
         CareContext.reference.in_([r.get("careContextReference") for r in refs]))).all()
     if not refs or len(contexts) != len(refs):
         return "Consent lists care contexts this HIP does not hold", None
@@ -397,7 +423,7 @@ def consent_notify(db: Session, hospital: Hospital, headers: dict, body: dict) -
     notification = body.get("notification") or {}
     status, consent_id = (notification.get("status") or "").upper(), notification.get("consentId")
     detail = notification.get("consentDetail") or {}
-    consent = db.scalar(select(HipConsent).where(HipConsent.consent_id == consent_id))
+    consent = db.scalar(select(HipConsent).where(HipConsent.hospital_id == hospital.id, HipConsent.consent_id == consent_id))
     response = {"response": {"requestId": headers.get("request-id")}}
     if status == "GRANTED":
         problem, patient = consent_problem(db, hospital, detail)
@@ -428,7 +454,7 @@ def consent_notify(db: Session, hospital: Hospital, headers: dict, body: dict) -
                 consent_id=consent_id, patient_id=consent.patient_id if consent else None,
                 details={"status": status, "hiTypes": detail.get("hiTypes"), "hiu": (detail.get("hiu") or {}).get("id")})
     db.commit()
-    http_status, data, _ = gateway.call(gateway.CONSENT_ON_NOTIFY_PATH, response, {"X-HIP-ID": gateway.hip_id()})
+    http_status, data, _ = gateway.call(gateway.CONSENT_ON_NOTIFY_PATH, response, {"X-HIP-ID": gateway.hip_id(hospital)})
     if check_accepted(db, tx, http_status, data, message) and not problem:
         tx.status = "success"
     return tx
@@ -439,7 +465,7 @@ def consent_notify(db: Session, hospital: Hospital, headers: dict, body: dict) -
 def health_information(db: Session, hospital: Hospital, headers: dict, body: dict) -> HipTransaction:
     transaction_id, hi_request = body.get("transactionId"), body.get("hiRequest") or {}
     consent_id = (hi_request.get("consent") or {}).get("id")
-    consent = db.scalar(select(HipConsent).where(HipConsent.consent_id == consent_id))
+    consent = db.scalar(select(HipConsent).where(HipConsent.hospital_id == hospital.id, HipConsent.consent_id == consent_id))
     key_material = hi_request.get("keyMaterial") or {}
     problem = None
     try:
@@ -475,15 +501,16 @@ def health_information(db: Session, hospital: Hospital, headers: dict, body: dic
                 transaction_id=transaction_id, consent_id=consent_id, patient_id=consent.patient_id if consent else None,
                 details={"dateRange": hi_request.get("dateRange"), "hiu": consent.hiu_id if consent else None})
     db.commit()
-    status, data, _ = gateway.call(gateway.HI_ON_REQUEST_PATH, on_request, {"X-HIP-ID": gateway.hip_id()})
+    status, data, _ = gateway.call(gateway.HI_ON_REQUEST_PATH, on_request, {"X-HIP-ID": gateway.hip_id(hospital)})
     check_accepted(db, tx, status, data, tx.message)
+    db.commit()  # release SQLite's write lock: the receiving HIU may be another hospital in this database
     if problem or tx.status == "failed":
-        db.commit()
         return tx
 
     # Only care contexts in the consent, of consented HI types, validated (HIP-eligible) and dated inside both ranges.
     refs = [r["careContextReference"] for r in consent.care_contexts]
-    contexts = db.scalars(select(CareContext).where(CareContext.reference.in_(refs))).all()
+    contexts = db.scalars(select(CareContext).where(CareContext.hospital_id == hospital.id,
+                                                    CareContext.reference.in_(refs))).all()
     own = crypto.generate_key_material()
     entries, statuses = [], []
     for c in contexts:
@@ -524,9 +551,9 @@ def health_information(db: Session, hospital: Hospital, headers: dict, body: dic
     session_status = "TRANSFERRED" if delivered and pushed_ok else "FAILED"
     notify = {"notification": {
         "consentId": consent_id, "transactionId": transaction_id, "doneAt": gateway.timestamp(),
-        "notifier": {"type": "HIP", "id": gateway.hip_id()},
-        "statusNotification": {"sessionStatus": session_status, "hipId": gateway.hip_id(), "statusResponses": statuses}}}
-    status, data, _ = gateway.call(gateway.HI_NOTIFY_PATH, notify, {"X-HIP-ID": gateway.hip_id()})
+        "notifier": {"type": "HIP", "id": gateway.hip_id(hospital)},
+        "statusNotification": {"sessionStatus": session_status, "hipId": gateway.hip_id(hospital), "statusResponses": statuses}}}
+    status, data, _ = gateway.call(gateway.HI_NOTIFY_PATH, notify, {"X-HIP-ID": gateway.hip_id(hospital)})
     tx.details = {**(tx.details or {}), "statusResponses": statuses, "pages": len(pages) if entries else 0}
     tx.status = "success" if session_status == "TRANSFERRED" else "failed"
     tx.message = (f"{delivered} of {len(statuses)} record(s) encrypted and sent to {consent.hiu_id}"
@@ -551,7 +578,7 @@ def handle_inbound(kind: str, headers: dict, body: dict) -> HipTransaction | Non
     headers = {k.lower(): v for k, v in headers.items()}
     with SessionLocal() as db:
         try:
-            hospital = hip_hospital(db)
+            hospital = hip_hospital(db, headers.get("x-hip-id"))
             if kind in CALLBACKS:
                 message = CALLBACKS[kind](db, body)
                 tx = record(db, hospital.id, kind, "inbound", "failed" if body.get("error") else "success", message,
@@ -563,7 +590,7 @@ def handle_inbound(kind: str, headers: dict, body: dict) -> HipTransaction | Non
             return tx
         except (gateway.GatewayError, HipError) as exc:
             db.rollback()
-            hospital_id = db.scalar(select(Hospital.id))
-            tx = record(db, hospital_id, kind, "inbound", "failed", f"Could not complete: {exc}")
+            hospital = hospital_for(db, headers.get("x-hip-id")) or db.scalar(select(Hospital).order_by(Hospital.id))
+            tx = record(db, hospital.id, kind, "inbound", "failed", f"Could not complete: {exc}")
             db.commit()
             return tx

@@ -1,7 +1,14 @@
-"""Simulation (ABDM_MODE=simulation) of the consent manager, the patient's consent decision and an external HIP
-("Sunrise Clinic (SIMULATED)") for the HIU workflow. Records it sends are synthetic, built with the FHIR engine,
-filtered to the consent's scope and encrypted exactly as a real HIP would. Calls arrive through the shared
-gateway client; callbacks go through app.hip.simulator's queue (signed and verified like real ones).
+"""Simulation (ABDM_MODE=simulation) of the consent manager and the patient's consent decision for the HIU workflow.
+
+Where the records come from:
+- Several hospitals in this database: the consent manager looks for care contexts that the *other* hospitals have
+  linked to the patient's ABHA address (e.g. surya@abdm). Each such hospital becomes a HIP of the exchange: it is
+  sent the consent artefact, receives the health information request and encrypts and pushes its own validated
+  records to the requesting hospital, all through the same HIP code that handles real ABDM requests.
+- A single hospital: an external HIP ("Sunrise Clinic (SIMULATED)") sends synthetic records, built with the FHIR
+  engine, filtered to the consent's scope and encrypted exactly as a real HIP would.
+Calls arrive through the shared gateway client; callbacks go through app.hip.simulator's queue (signed and
+verified like real ones). The consent manager's state is in memory and starts empty after a restart.
 """
 
 import hashlib
@@ -15,52 +22,106 @@ from app.hip import crypto, gateway
 from app.models import Doctor, Hospital, Patient
 
 EXTERNAL_HIP = "SIM_EXT_HIP_01"
-consent_requests: dict[str, dict] = {}  # consent request id -> {"consent": body, "status": ...}
+consent_requests: dict[str, dict] = {}  # consent request id -> {"consent": body, "status", "artefacts", "hiu_id"}
 artefacts: dict[str, dict] = {}  # artefact id -> consentDetail
-pushes: list[dict] = []  # what was pushed to the HIU (metadata only)
+local_hips: dict[str, str] = {}  # artefact id -> HIP ID of the hospital in this database that holds the records
+pushes: list[dict] = []  # what the simulated external HIP pushed to the HIU (metadata only)
 
 HI_TYPE_OF = {"OPConsultRecord": "OPConsultation", "PrescriptionRecord": "Prescription",
               "DiagnosticReportRecord": "DiagnosticReport", "DischargeSummaryRecord": "DischargeSummary"}
 
 
+class NoSources(ValueError):
+    pass
+
+
 def reset() -> None:
-    consent_requests.clear(), artefacts.clear(), pushes.clear()
+    consent_requests.clear(), artefacts.clear(), local_hips.clear(), pushes.clear()
 
 
-def queue(kind: str, body: dict) -> None:
+def queue(kind: str, body: dict, hiu_id: str | None = None) -> None:
+    """A consent manager callback to an HIU."""
     from app.hip import simulator
     headers = simulator.callback_headers()
-    headers["X-HIU-ID"] = gateway.hiu_id()
+    headers["X-HIU-ID"] = hiu_id or gateway.hiu_id()
     simulator._callbacks.append((kind, headers, body))
 
 
+def queue_hip(kind: str, body: dict, hip_id: str) -> None:
+    """A consent manager request to a HIP (consent notification, health information request)."""
+    from app.hip import simulator
+    simulator._callbacks.append((kind, simulator.callback_headers(hip_id), body))
+
+
 def receive(path: str, body: dict, headers: dict) -> tuple[int, dict | None]:
-    request_id = headers.get("REQUEST-ID")
+    request_id, hiu_id = headers.get("REQUEST-ID"), headers.get("X-HIU-ID")
     if path == gateway.CONSENT_INIT_PATH:
         consent_id = str(uuid.uuid4())
-        consent_requests[consent_id] = {"consent": body["consent"], "status": "REQUESTED", "artefacts": []}
-        queue("hiu_on_init", {"consentRequest": {"id": consent_id}, "error": None, "response": {"requestId": request_id}})
+        consent_requests[consent_id] = {"consent": body["consent"], "status": "REQUESTED", "artefacts": [], "hiu_id": hiu_id}
+        queue("hiu_on_init", {"consentRequest": {"id": consent_id}, "error": None, "response": {"requestId": request_id}},
+              hiu_id)
     elif path == gateway.CONSENT_STATUS_PATH:
         item = consent_requests.get(body.get("consentRequestId"))
         queue("hiu_on_status", {"consentRequest": {"id": body.get("consentRequestId"), "status": item["status"] if item else None},
                                 "error": None if item else {"code": "ABDM-1039", "message": "Invalid Consent request id"},
-                                "response": {"requestId": request_id}})
+                                "response": {"requestId": request_id}}, hiu_id)
     elif path == gateway.CONSENT_FETCH_PATH:
         detail = artefacts.get(body.get("consentId"))
+        if detail and detail["hiu"]["id"] != hiu_id:
+            detail = None  # an artefact is only given to the HIU it was granted to
         reply = {"consent": {"status": "GRANTED", "consentDetail": detail, "signature": "simulated"} if detail else None,
                  "error": None if detail else {"code": "ABDM-1080", "message": "Invalid Consent artefact id"},
                  "response": {"requestId": request_id}}
-        queue("hiu_on_fetch", reply)
+        queue("hiu_on_fetch", reply, hiu_id)
     elif path == gateway.HI_REQUEST_PATH:
-        transaction_id = str(uuid.uuid4())
+        transaction_id, artefact_id = str(uuid.uuid4()), body["hiRequest"]["consent"]["id"]
         queue("hiu_on_request", {"hiRequest": {"transactionId": transaction_id, "sessionStatus": "REQUESTED"},
-                                 "error": None, "response": {"requestId": request_id}})
-        queue("hiu_push", {"transactionId": transaction_id, "hiRequest": body["hiRequest"]})
+                                 "error": None, "response": {"requestId": request_id}}, hiu_id)
+        if artefact_id in local_hips:  # forward to the hospital holding the records; it pushes to the HIU itself
+            queue_hip("health_information", {"transactionId": transaction_id, "hiRequest": body["hiRequest"]},
+                      local_hips[artefact_id])
+        else:
+            queue("hiu_push", {"transactionId": transaction_id, "hiRequest": body["hiRequest"]}, hiu_id)
     return 202, None
 
 
+def local_sources(consent: dict, hi_types: list[str]) -> list[tuple[str, str, list[dict]]] | None:
+    """Care contexts that other hospitals of this database linked to the patient's ABHA address, within the
+    requested types and dates: [(HIP ID, hospital name, careContexts)]. None when this database has one hospital."""
+    from sqlalchemy import func, select
+
+    from app.database import SessionLocal
+    from app.hip.service import hospital_for, parse_time
+    from app.models import CareContext
+    address = (consent["patient"]["id"] or "").lower()
+    date_range = consent["permission"]["dateRange"]
+    start, end = parse_time(date_range["from"]), parse_time(date_range["to"])
+    with SessionLocal() as db:
+        if db.scalar(select(func.count(Hospital.id))) < 2:
+            return None
+        requester = hospital_for(db, consent["hiu"]["id"], "hiu")
+        rows = db.execute(select(CareContext, Patient).join(Patient, Patient.id == CareContext.patient_id).where(
+            CareContext.link_status == "linked", func.lower(CareContext.linked_abha_address) == address)
+            .order_by(CareContext.hospital_id, CareContext.id)).all()
+        sources: dict[str, tuple[str, list[dict]]] = {}
+        for context, patient in rows:
+            if requester is not None and context.hospital_id == requester.id:
+                continue  # the HIU's own records are already in its own system
+            if context.hi_type not in hi_types or not start <= context.record_date <= end:
+                continue
+            hospital = db.get(Hospital, context.hospital_id)
+            hip_id = gateway.hip_id(hospital)
+            owner = hospital_for(db, hip_id, "hip")
+            if owner is None or owner.id != hospital.id:
+                continue  # this hospital has no HIP ID of its own, so ABDM could not route to it
+            sources.setdefault(hip_id, (hospital.name, []))[1].append(
+                {"patientReference": patient.patient_code, "careContextReference": context.reference})
+        return [(hip_id, name, contexts) for hip_id, (name, contexts) in sources.items()]
+
+
 def decide(consent_request_id: str, grant: bool, hi_types: list[str] | None = None, reason: str | None = None) -> dict:
-    """The patient's decision in their ABHA app (simulated). A grant may narrow the requested record types."""
+    """The patient's decision in their ABHA app (simulated). A grant may narrow the requested record types.
+    A grant creates one consent artefact per HIP holding matching records, as ABDM's consent manager does."""
     item = consent_requests.get(consent_request_id)
     if item is None:
         raise ValueError("Unknown consent request (the simulator restarts empty)")
@@ -69,27 +130,50 @@ def decide(consent_request_id: str, grant: bool, hi_types: list[str] | None = No
         item["status"] = "DENIED"
         notification = {"consentRequestId": consent_request_id, "status": "DENIED", "reason": reason, "consentArtefacts": []}
     else:
+        granted_types = sorted(set(hi_types or consent["hiTypes"]) & set(consent["hiTypes"]))
+        sources = local_sources(consent, granted_types)
+        if sources is None:  # a single hospital: the synthetic external provider
+            sources = [(EXTERNAL_HIP, "Sunrise Clinic (SIMULATED)",
+                        [{"patientReference": "SUN-000777", "careContextReference": f"SUN-CC-{i}"} for i in range(1, 6)])]
+        elif not sources:
+            raise NoSources(f"No other hospital has records linked to {consent['patient']['id']} of the requested "
+                            "types and dates. Link them first on that hospital's ABDM HIP page.")
         item["status"] = "GRANTED"
-        artefact_id = str(uuid.uuid4())
-        artefacts[artefact_id] = {
-            "consentId": artefact_id, "schemaVersion": "v3", "createdAt": gateway.timestamp(),
-            "hip": {"id": EXTERNAL_HIP}, "hiu": consent["hiu"], "patient": consent["patient"],
-            "hiTypes": sorted(set(hi_types or consent["hiTypes"]) & set(consent["hiTypes"])),
-            "purpose": consent["purpose"], "requester": consent["requester"], "permission": consent["permission"],
-            "careContexts": [{"patientReference": "SUN-000777", "careContextReference": f"SUN-CC-{i}"} for i in range(1, 6)],
-            "consentManager": {"id": "sbx"}, "lastUpdated": gateway.timestamp()}
-        item["artefacts"].append(artefact_id)
+        ids = []
+        for hip_id, _, contexts in sources:
+            artefact_id = str(uuid.uuid4())
+            detail = {
+                "consentId": artefact_id, "schemaVersion": "v3", "createdAt": gateway.timestamp(),
+                "hip": {"id": hip_id}, "hiu": consent["hiu"], "patient": consent["patient"], "hiTypes": granted_types,
+                "purpose": consent["purpose"], "requester": consent["requester"], "permission": consent["permission"],
+                "careContexts": contexts, "consentManager": {"id": "sbx"}, "lastUpdated": gateway.timestamp()}
+            artefacts[artefact_id] = detail
+            item["artefacts"].append(artefact_id)
+            ids.append({"id": artefact_id})
+            if hip_id != EXTERNAL_HIP:  # the HIP learns of the consent before the HIU asks it for data
+                local_hips[artefact_id] = hip_id
+                queue_hip("consent_notify", {"notification": {"status": "GRANTED", "consentId": artefact_id,
+                                                              "consentDetail": detail, "signature": "simulated"}}, hip_id)
         notification = {"consentRequestId": consent_request_id, "status": "GRANTED", "reason": None,
-                        "consentArtefacts": [{"id": artefact_id}]}
-    queue("hiu_notify", {"notification": notification})
+                        "consentArtefacts": ids}
+    queue("hiu_notify", {"notification": notification}, item["hiu_id"])
     from app.hip import simulator
     simulator.flush()
     return notification
 
 
 def revoke(consent_request_id: str) -> None:
-    ids = [{"id": a} for a in consent_requests[consent_request_id]["artefacts"]]
-    queue("hiu_notify", {"notification": {"consentRequestId": consent_request_id, "status": "REVOKED", "consentArtefacts": ids}})
+    item = consent_requests.get(consent_request_id)
+    if item is None:
+        raise ValueError("Unknown consent request (the simulator restarts empty)")
+    item["status"] = "REVOKED"
+    for artefact_id in item["artefacts"]:  # the HIPs stop sharing at once
+        if artefact_id in local_hips:
+            queue_hip("consent_notify", {"notification": {"status": "REVOKED", "consentId": artefact_id}},
+                      local_hips[artefact_id])
+    ids = [{"id": a} for a in item["artefacts"]]
+    queue("hiu_notify", {"notification": {"consentRequestId": consent_request_id, "status": "REVOKED", "consentArtefacts": ids}},
+          item["hiu_id"])
     from app.hip import simulator
     simulator.flush()
 

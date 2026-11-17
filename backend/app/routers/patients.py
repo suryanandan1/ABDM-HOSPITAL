@@ -10,7 +10,7 @@ from app.models import Hospital, Patient, User, utcnow
 from app.schemas import (AbhaVerifyRequest, DuplicateCandidate, Page, PatientCreate, PatientOut,
                          PatientSummary, PatientUpdate)
 from app.security import require
-from app.services import audit, changed_fields, find_duplicate_patients, get_or_404, paginate
+from app.services import audit, changed_fields, commit, find_duplicate_patients, get_or_404, paginate
 
 router = APIRouter(prefix="/patients", tags=["patients"])
 
@@ -89,9 +89,7 @@ def register_patient(body: PatientCreate, request: Request,
     if duplicates:
         details["duplicate_warning_overridden"] = [d["patient"].patient_code for d in duplicates]
     audit(db, user, "patient.create", "patient", patient.id, details, request)
-    db.commit()
-    db.refresh(patient)
-    return patient
+    return commit(db, patient)
 
 
 @router.get("/{patient_id}", response_model=PatientOut)
@@ -146,9 +144,7 @@ def verify_abha(patient_id: int, body: AbhaVerifyRequest, request: Request,
     patient.abha_verified_by_id = user.id
     patient.abha_verification_method = body.method
     audit(db, user, "patient.abha_verified", "patient", patient.id, {"method": body.method, "note": body.note}, request)
-    db.commit()
-    db.refresh(patient)
-    return patient
+    return commit(db, patient)
 
 
 @router.delete("/{patient_id}/abha/verify", response_model=PatientOut)
@@ -160,6 +156,4 @@ def revoke_abha_verification(patient_id: int, request: Request,
     patient.abha_verified = False
     patient.abha_verified_at = patient.abha_verified_by_id = patient.abha_verification_method = None
     audit(db, user, "patient.abha_unverified", "patient", patient.id, request=request)
-    db.commit()
-    db.refresh(patient)
-    return patient
+    return commit(db, patient)

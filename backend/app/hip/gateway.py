@@ -53,11 +53,16 @@ def simulation() -> bool:
     return settings.abdm_mode == "simulation"
 
 
-def hip_id() -> str | None:
+def hip_id(hospital=None) -> str | None:
+    """The HIP service ID of a hospital: its own (Hospital.abdm_hip_id), else the bridge-wide default."""
+    if hospital is not None and hospital.abdm_hip_id:
+        return hospital.abdm_hip_id
     return settings.abdm_hip_id or ("SIM_HIP_001" if simulation() else None)
 
 
-def hiu_id() -> str | None:
+def hiu_id(hospital=None) -> str | None:
+    if hospital is not None and hospital.abdm_hiu_id:
+        return hospital.abdm_hiu_id
     return settings.abdm_hiu_id or ("SIM_HIU_LOCAL" if simulation() else None)
 
 

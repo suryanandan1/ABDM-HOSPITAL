@@ -1,6 +1,8 @@
 """In-process stand-in for the ABDM gateway, consent manager, the patient's ABHA app and an HIU.
 
-Used only when ABDM_MODE=simulation. It receives the HIP's outbound calls exactly as the real gateway would
+Used only when ABDM_MODE=simulation. Several hospitals can share this bridge: every message carries the
+addressed hospital's X-HIP-ID, and a data push to a push URL of this bridge (/api/hiu/data-push/...) is
+delivered to that hospital's HIU, so hospitals in this database exchange records with each other. It receives the HIP's outbound calls exactly as the real gateway would
 (same paths, headers and bodies), signs its callbacks with its own RSA key (verified by the same code path as
 real gateway tokens) and decrypts data pushes with its own HIU keys. Its state is in memory and every
 transaction it causes is labelled "simulation". It is not a model of ABDM's internal rules.
@@ -14,11 +16,12 @@ import uuid
 import jwt
 from cryptography.hazmat.primitives.asymmetric import rsa
 
+from app import demo
 from app.hip import crypto, gateway
 
 KID = "simulated-abdm-gateway"
 _key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-registry: dict[str, dict] = {}  # simulated ABHA accounts: address -> {name, gender, yearOfBirth, abhaNumber}
+registry: dict[str, dict] = demo.abha_accounts()  # simulated ABHA accounts: address -> {name, gender, yearOfBirth, abhaNumber}
 outbox: list[dict] = []  # calls received from the HIP (newest last)
 phone: dict[str, str] = {}  # last OTP "delivered" by SMS per mobile number
 hiu: dict[str, dict] = {}  # transaction id -> {key material, decrypted summary}
@@ -28,6 +31,7 @@ _callbacks: list[tuple[str, dict, dict]] = []
 def reset() -> None:
     from app.hiu import simulator as hiu_simulator
     registry.clear(), outbox.clear(), phone.clear(), hiu.clear(), _callbacks.clear()
+    registry.update(demo.abha_accounts())  # the demo people always have ABHA accounts
     hiu_simulator.reset()
 
 
@@ -42,9 +46,9 @@ def jwks() -> dict:
     return {"keys": [{**jwk, "kid": KID, "alg": "RS256", "use": "sig"}]}
 
 
-def callback_headers() -> dict:
+def callback_headers(hip_id: str | None = None) -> dict:
     return {"Authorization": f"Bearer {issue_token()}", "REQUEST-ID": str(uuid.uuid4()), "TIMESTAMP": gateway.timestamp(),
-            "X-HIP-ID": gateway.hip_id(), "X-CM-ID": "sbx"}
+            "X-HIP-ID": hip_id or gateway.hip_id(), "X-CM-ID": "sbx"}
 
 
 def deliver_sms(mobile: str, otp: str) -> None:
@@ -72,7 +76,7 @@ def receive(method: str, path: str, body: dict | None, headers: dict) -> tuple[i
             reply["error"] = {"code": "SIM-422", "message": "Demographic details do not match the ABHA account (simulated)"}
         else:
             reply["linkToken"] = issue_token(abhaAddress=body["abhaAddress"], abhaNumber=account.get("abhaNumber"))
-        _callbacks.append(("on_generate_token", callback_headers(), reply))
+        _callbacks.append(("on_generate_token", callback_headers(headers.get("X-HIP-ID")), reply))
     elif path == gateway.ADD_CARE_CONTEXTS_PATH:
         reply = {"abhaAddress": body.get("abhaAddress"), "response": {"requestId": headers["REQUEST-ID"]}}
         try:
@@ -80,12 +84,19 @@ def receive(method: str, path: str, body: dict | None, headers: dict) -> tuple[i
             reply["status"] = "Successfully Linked care context (simulated)"
         except jwt.PyJWTError:
             reply["error"] = {"code": "SIM-401", "message": "Invalid or expired link token (simulated)"}
-        _callbacks.append(("on_add_care_contexts", callback_headers(), reply))
+        _callbacks.append(("on_add_care_contexts", callback_headers(headers.get("X-HIP-ID")), reply))
     return 202, None
 
 
+LOCAL_PUSH_PATH = "/api/hiu/data-push/"
+
+
 def receive_push(url: str, body: dict) -> int:
-    """The simulated HIU receives a data push and decrypts it with its own key material."""
+    """A data push from a HIP. To a push URL of this bridge it is delivered, after the HIP's own work is done, to
+    the HIU of the hospital that opened it; otherwise the simulated HIU decrypts it with its own key material."""
+    if LOCAL_PUSH_PATH in url:
+        _callbacks.append(("local_push", {}, {"token": url.rsplit("/", 1)[-1], "body": body}))
+        return 202
     session = hiu.get(body.get("transactionId"))
     if session is None:
         return 404
@@ -109,6 +120,10 @@ def flush() -> None:
     from app.hiu import service as hiu_service, simulator as hiu_simulator
     while _callbacks:
         kind, headers, body = _callbacks.pop(0)
+        if kind == "local_push":  # a hospital's HIP pushing to another hospital's HIU (no gateway token involved)
+            with SessionLocal() as db:
+                hiu_service.receive_push(db, body["token"], body["body"])
+            continue
         gateway.verify_callback(headers["Authorization"])
         if kind == "hiu_push":  # the simulated external HIP pushes data to the HIU's push URL
             with SessionLocal() as db:
@@ -119,10 +134,10 @@ def flush() -> None:
             service.handle_inbound(kind, headers, body)
 
 
-def send(kind: str, body: dict):
+def send(kind: str, body: dict, hip_id: str | None = None):
     """A signed ABDM callback into the HIP, through the same verification as real callbacks."""
     from app.hip import service
-    headers = callback_headers()
+    headers = callback_headers(hip_id)
     gateway.verify_callback(headers["Authorization"])
     tx = service.handle_inbound(kind, headers, body)
     flush()
@@ -138,43 +153,48 @@ def reply_to(path: str, request_id: str) -> dict | None:
 
 # ---------- simulated patient / consent manager / HIU actions ----------
 
-def discover(abha_address: str, name: str, gender: str, year_of_birth: int, mobile: str | None) -> dict:
+def discover(abha_address: str, name: str, gender: str, year_of_birth: int, mobile: str | None,
+             hip_id: str | None = None) -> dict:
     body = {"transactionId": str(uuid.uuid4()),
             "patient": {"id": abha_address, "name": name, "gender": gender, "yearOfBirth": year_of_birth,
                         "verifiedIdentifiers": [{"type": "MOBILE", "value": mobile}] if mobile else [],
                         "unverifiedIdentifiers": []}}
-    _, request_id = send("discover", body)
+    _, request_id = send("discover", body, hip_id)
     return {"request": body, "response": reply_to(gateway.ON_DISCOVER_PATH, request_id)}
 
 
-def link_init(transaction_id: str, abha_address: str, discovered: list[dict]) -> dict:
+def link_init(transaction_id: str, abha_address: str, discovered: list[dict], hip_id: str | None = None) -> dict:
     body = {"transactionId": transaction_id, "abhaAddress": abha_address, "patient": discovered}
-    _, request_id = send("link_init", body)
+    _, request_id = send("link_init", body, hip_id)
     return reply_to(gateway.ON_INIT_LINK_PATH, request_id)
 
 
-def link_confirm(link_reference: str, otp: str) -> dict:
-    _, request_id = send("link_confirm", {"confirmation": {"linkRefNumber": link_reference, "token": otp}})
+def link_confirm(link_reference: str, otp: str, hip_id: str | None = None) -> dict:
+    _, request_id = send("link_confirm", {"confirmation": {"linkRefNumber": link_reference, "token": otp}}, hip_id)
     return reply_to(gateway.ON_CONFIRM_LINK_PATH, request_id)
 
 
 def grant_consent(abha_address: str, patient_reference: str, care_contexts: list[str], hi_types: list[str],
                   date_from: str, date_to: str, erase_at: str, status: str = "GRANTED", consent_id: str | None = None,
-                  hip_id: str | None = None) -> dict:
+                  hip_id: str | None = None, to_hip: str | None = None) -> dict:
+    """The patient grants a simulated HIU access. to_hip: the HIP the notification is sent to; hip_id: the HIP
+    named in the artefact (normally the same; different to test that a HIP refuses another HIP's consent)."""
     consent_id = consent_id or str(uuid.uuid4())
+    to_hip = to_hip or gateway.hip_id()
     detail = {"schemaVersion": "v3", "consentId": consent_id, "createdAt": gateway.timestamp(),
-              "patient": {"id": abha_address}, "hip": {"id": hip_id or gateway.hip_id()}, "hiu": {"id": "SIM_HIU_001"},
+              "patient": {"id": abha_address}, "hip": {"id": hip_id or to_hip}, "hiu": {"id": "SIM_HIU_001"},
               "careContexts": [{"patientReference": patient_reference, "careContextReference": r} for r in care_contexts],
               "purpose": {"text": "Care Management", "code": "CAREMGT"}, "hiTypes": hi_types,
               "consentManager": {"id": "sbx"},
               "permission": {"accessMode": "VIEW", "dateRange": {"from": date_from, "to": date_to},
                              "dataEraseAt": erase_at, "frequency": {"unit": "HOUR", "value": 1, "repeats": 0}}}
     _, request_id = send("consent_notify", {"notification": {"status": status, "consentId": consent_id,
-                                                             "consentDetail": detail, "signature": "simulated"}})
+                                                             "consentDetail": detail, "signature": "simulated"}},
+                         to_hip)
     return {"consent_id": consent_id, "response": reply_to(gateway.CONSENT_ON_NOTIFY_PATH, request_id)}
 
 
-def request_health_information(consent_id: str, date_from: str, date_to: str) -> dict:
+def request_health_information(consent_id: str, date_from: str, date_to: str, hip_id: str | None = None) -> dict:
     """The HIU asks for data: fresh key material, then the HIP pushes encrypted records to the HIU."""
     own = crypto.generate_key_material()
     transaction_id = str(uuid.uuid4())
@@ -186,7 +206,7 @@ def request_health_information(consent_id: str, date_from: str, date_to: str) ->
                         "dhPublicKey": {"expiry": "2099-01-01T00:00:00.000Z", "parameters": crypto.PARAMETERS,
                                         "keyValue": crypto.b64(own["public"])},
                         "nonce": crypto.b64(own["nonce"])}}}
-    tx, request_id = send("health_information", body)
+    tx, request_id = send("health_information", body, hip_id)
     notify = last_call(gateway.HI_NOTIFY_PATH)
     return {"transaction_id": transaction_id, "on_request": reply_to(gateway.HI_ON_REQUEST_PATH, request_id),
             "received_by_hiu": hiu[transaction_id]["received"],

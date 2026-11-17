@@ -6,7 +6,7 @@ from app.database import get_db
 from app.models import Doctor, User
 from app.schemas import DoctorCreate, DoctorOut, DoctorUpdate, Page
 from app.security import require
-from app.services import audit, changed_fields, get_or_404, paginate
+from app.services import audit, changed_fields, commit, get_or_404, paginate
 
 router = APIRouter(prefix="/doctors", tags=["doctors"])
 
@@ -54,9 +54,7 @@ def create_doctor(body: DoctorCreate, request: Request,
     db.flush()
     audit(db, user, "doctor.create", "doctor", doctor.id,
           {"name": doctor.full_name, "registration_number": doctor.registration_number}, request)
-    db.commit()
-    db.refresh(doctor)
-    return doctor
+    return commit(db, doctor)
 
 
 @router.patch("/{doctor_id}", response_model=DoctorOut)

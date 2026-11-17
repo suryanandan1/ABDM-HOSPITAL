@@ -2,7 +2,10 @@
 
 Usage:
     python init_db.py            # safe to run repeatedly; applies new migrations, only adds what is missing
-    python init_db.py --demo     # also adds sample staff, doctors and patients
+    python init_db.py --demo     # also adds sample staff, doctors and patients, two more hospitals (each with
+                                 # staff, doctors and a lab catalogue) and shared patients with ABHA addresses
+                                 # such as surya@abdm (see app/demo.py); then scripts/seed_shared_records.py
+                                 # adds shareable records for the HIP/HIU exchange between the hospitals
 
 Schema changes are Alembic migrations in migrations/versions (create one with
 `alembic revision --autogenerate -m "..."` after changing app/models.py, then review it).
@@ -17,6 +20,7 @@ from alembic.config import Config
 from sqlalchemy import Engine, inspect, select
 from sqlalchemy.orm import Session
 
+from app import demo
 from app.config import settings
 from app.database import SessionLocal, engine
 from app.models import Doctor, Hospital, LabTest, Patient, Role, User
@@ -119,17 +123,103 @@ def seed_demo(db: Session, hospital: Hospital) -> None:
     print(f"Demo data ready. Demo users: {', '.join(u for u, _, _ in staff)} (password {DEMO_PASSWORD})")
 
 
+def seed_network(db: Session, primary: Hospital) -> None:
+    """The demo ABDM network (app/demo.py): two more hospitals with staff, doctors and a lab catalogue, and the demo
+    people registered at each of their hospitals with their one ABHA address. Only adds what is missing."""
+    roles = {r.code: r for r in db.scalars(select(Role))}
+    simulation = settings.abdm_mode == "simulation"
+    hospitals = {demo.PRIMARY: primary}
+    for code, profile in demo.HOSPITALS.items():
+        hospital = primary if code == demo.PRIMARY else db.scalar(select(Hospital).where(Hospital.code == code))
+        if hospital is None:
+            hospital = Hospital(code=code, name=profile["name"])
+            db.add(hospital)
+            print(f"Created hospital {profile['name']} ({code})")
+        for field in ("city", "state", "facility_type", "address", "pincode", "phone"):
+            if field in profile and not getattr(hospital, field):
+                setattr(hospital, field, profile[field])
+        if simulation:  # real HIP/HIU IDs are issued by NHA; set them on the Hospital profile in sandbox mode
+            hip_id = profile["hip_id"] if code == hospital.code else f"SIM_HIP_{hospital.code}"
+            hiu_id = profile["hiu_id"] if code == hospital.code else f"SIM_HIU_{hospital.code}"
+            hospital.abdm_hip_id = hospital.abdm_hip_id or hip_id
+            hospital.abdm_hiu_id = hospital.abdm_hiu_id or hiu_id
+        db.flush()
+        hospitals[code] = hospital
+
+    for code, staff in demo.STAFF.items():
+        hospital = hospitals[code]
+        for username, name, role, doctor in staff:
+            user = db.scalar(select(User).where(User.username == username))
+            if user is None:
+                user = User(hospital_id=hospital.id, role_id=roles[role].id, username=username, full_name=name,
+                            password_hash=hash_password(DEMO_PASSWORD))
+                db.add(user)
+                db.flush()
+            if doctor and db.scalar(select(Doctor).where(Doctor.user_id == user.id)) is None:
+                db.add(Doctor(hospital_id=hospital.id, user_id=user.id, full_name=name, **doctor))
+        if db.scalar(select(LabTest).where(LabTest.hospital_id == hospital.id)) is None:
+            db.add_all(LabTest(hospital_id=hospital.id, **test) for test in DEMO_LAB_TESTS)
+    db.flush()
+
+    for person in demo.PEOPLE:
+        for code in person["hospitals"]:
+            hospital = hospitals[code]
+            patient = db.scalar(select(Patient).where(Patient.hospital_id == hospital.id,
+                                                      Patient.full_name == person["full_name"],
+                                                      Patient.mobile == person["mobile"]))
+            if patient is None:
+                receptionist = db.scalar(select(User).join(Role).where(User.hospital_id == hospital.id,
+                                                                       Role.code == "receptionist").order_by(User.id))
+                patient = Patient(hospital_id=hospital.id, patient_code=f"tmp-{code}-{person['mobile']}",
+                                  full_name=person["full_name"], date_of_birth=person["date_of_birth"],
+                                  year_of_birth=person["date_of_birth"].year, gender=person["gender"],
+                                  mobile=person["mobile"], city=person["city"], state=person["state"],
+                                  registered_by_id=receptionist.id if receptionist else None)
+                db.add(patient)
+                db.flush()
+                patient.patient_code = f"{hospital.code}-{patient.id:06d}"
+            taken = db.scalar(select(Patient.id).where(Patient.hospital_id == hospital.id, Patient.id != patient.id,
+                                                       Patient.abha_address == person["abha_address"]))
+            if not patient.abha_address and not taken:  # as on the patient's ABHA card; verified later with ABDM
+                patient.abha_address, patient.abha_number = person["abha_address"], person["abha_number"]
+    db.commit()
+    print("Demo network ready:")
+    for code, hospital in hospitals.items():
+        logins = ("admin, dr.mehta, dr.rao, reception, labtech, hims" if code == demo.PRIMARY
+                  else ", ".join(u for u, *_ in demo.STAFF[code]))
+        print(f"  {hospital.name} ({hospital.code}) HIP {hospital.abdm_hip_id or '-'} / HIU {hospital.abdm_hiu_id or '-'}: {logins}")
+    print("  Patients and their ABHA addresses: " + ", ".join(
+        f"{p['full_name']} {p['abha_address']} ({'/'.join(p['hospitals'])})" for p in demo.PEOPLE))
+
+
 def migrate(bind: Engine = engine) -> None:
     """Bring the database to the latest migration. A database created before migrations existed (tables but no
     alembic_version) is first marked as being at the baseline, so only the newer migrations run on it."""
     config = Config(str(Path(__file__).resolve().parent / "alembic.ini"))
     config.attributes["configure_logger"] = False
-    with bind.begin() as connection:
-        config.attributes["connection"] = connection
-        tables = set(inspect(connection).get_table_names())
-        if "users" in tables and "alembic_version" not in tables:
-            command.stamp(config, BASELINE_REVISION)
-        command.upgrade(config, "head")
+    sqlite = bind.dialect.name == "sqlite"
+    with bind.connect() as connection:
+        if sqlite:
+            # Batch migrations rebuild a table (copy, drop, rename). With foreign keys enforced SQLite refuses to
+            # drop a table other rows point at, so enforcement is off during migrations (it can only be switched
+            # outside a transaction); rows keep their ids, and the check below proves every reference is intact.
+            connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
+            connection.commit()
+        try:
+            with connection.begin():
+                config.attributes["connection"] = connection
+                tables = set(inspect(connection).get_table_names())
+                if "users" in tables and "alembic_version" not in tables:
+                    command.stamp(config, BASELINE_REVISION)
+                command.upgrade(config, "head")
+                if sqlite:
+                    broken = connection.exec_driver_sql("PRAGMA foreign_key_check").fetchall()
+                    if broken:
+                        raise RuntimeError(f"Migration left broken references, not applied: {broken[:5]}")
+        finally:
+            if sqlite:
+                connection.exec_driver_sql("PRAGMA foreign_keys=ON")
+                connection.commit()
 
 
 def main() -> None:
@@ -143,6 +233,7 @@ def main() -> None:
                         settings.admin_username.lower(), settings.admin_password)
         if "--demo" in sys.argv:
             seed_demo(db, hospital)
+            seed_network(db, hospital)
     print("Database initialised.")
 
 
